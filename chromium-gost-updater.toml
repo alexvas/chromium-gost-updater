@@ -1,0 +1,14 @@
+# Example ~/.chromium-gost-updater.toml
+
+[download]
+retries = 5
+
+[auth]
+password_attempts = 3
+
+[timing]
+# в секундах
+check_remote_interval = 3600   # раз в час
+
+[paths]
+tmp_dir = "/tmp/chromium-gost-updater"

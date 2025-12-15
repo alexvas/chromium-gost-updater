@@ -1,0 +1,8 @@
+[Unit]
+Description=Chromium Gost Updater (user service)
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/chromium-gost-updater-wrapper.sh --show-tray-lazily
+Restart=on-failure

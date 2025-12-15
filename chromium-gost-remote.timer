@@ -1,0 +1,11 @@
+[Unit]
+Description=Run chromium-gost updater remote/version check hourly
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+Unit=chromium-gost-updater.service
+
+[Install]
+WantedBy=timers.target
