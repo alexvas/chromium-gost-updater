@@ -1,0 +1,219 @@
+# SourceCraft CI/CD configuration for building and releasing packages
+# Equivalent to GitHub Actions workflow build-packages.yml
+
+# Configure triggers for workflow execution
+on:
+  # Run workflow when pushing tags starting with 'v'
+  push:
+    - workflows: [build-packages-workflow]
+      filter:
+        tags: "v*"
+  
+  # Allow manual workflow execution
+  # Note: In SourceCraft, manual execution is available through the UI
+  # for any configured workflow
+
+# Define workflow with inputs for manual execution
+workflows:
+  build-packages-workflow:
+    # Define inputs for manual execution
+    inputs:
+      version:
+        type: string
+        description: "Version to build (if not provided, will be extracted from tag or generated)"
+        required: false
+        default: ""
+    
+    # Define tasks for the workflow
+    tasks:
+      # Build DEB package
+      - name: build-deb-task
+      
+      # Build RPM package
+      - name: build-rpm-task
+      
+      # Create release (depends on build tasks)
+      - name: release-task
+        needs: [build-deb-task, build-rpm-task]
+
+# Define tasks outside workflows block for reusability
+tasks:
+  # Task for building DEB package
+  - name: build-deb-task
+    cubes:
+      # Checkout code
+      - name: checkout-code
+        script:
+          - git config --global --add safe.directory '*'
+          - git fetch --all --tags
+          - git checkout ${{ env.SRC_GIT_REF_NAME }}
+      
+      # Set up Python
+      - name: setup-python
+        image: docker.io/library/python:3.11
+        script:
+          - python --version
+      
+      # Install build dependencies
+      - name: install-deb-dependencies
+        script:
+          - sudo apt-get update
+          - sudo apt-get install -y build-essential devscripts debhelper dh-python python3-all fakeroot
+      
+      # Get version from tag or generate
+      - name: get-deb-version
+        script:
+          - |
+            if [[ "${SRC_GIT_REF_TYPE}" == "tag" && "${SRC_GIT_REF_NAME}" == v* ]]; then
+              VERSION=${SRC_GIT_REF_NAME#v}
+            else
+              VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+            fi
+            echo "VERSION=$VERSION" >> $SRC_ENV
+            echo "Version: $VERSION"
+      
+      # Prepare debian directory and changelog
+      - name: prepare-debian-dir
+        script:
+          - mkdir -p debian
+          - |
+            if [ ! -f debian/changelog ]; then
+              # Create changelog if it doesn't exist
+              dch --create --package chromium-gost-updater \
+                  --newversion $VERSION \
+                  --distribution stable \
+                  --controlmaint "Release $VERSION"
+            elif ! grep -q "^chromium-gost-updater ($VERSION)" debian/changelog; then
+              # Update version in existing changelog
+              dch --newversion $VERSION \
+                  --distribution stable \
+                  "Release $VERSION"
+            fi
+      
+      # Build DEB package
+      - name: build-deb-package
+        script:
+          - dpkg-buildpackage -us -uc -b
+          # Copy package to current directory for artifacts
+          - cp ../*.deb . || true
+      
+      # Upload DEB artifact
+      - name: upload-deb-artifact
+        artifacts:
+          paths:
+            - "*.deb"
+
+  # Task for building RPM package
+  - name: build-rpm-task
+    cubes:
+      # Checkout code
+      - name: checkout-code-rpm
+        script:
+          - git config --global --add safe.directory '*'
+          - git fetch --all --tags
+          - git checkout ${{ env.SRC_GIT_REF_NAME }}
+      
+      # Set up Python
+      - name: setup-python-rpm
+        image: docker.io/library/python:3.11
+        script:
+          - python --version
+      
+      # Install RPM build dependencies
+      - name: install-rpm-dependencies
+        script:
+          - sudo apt-get update
+          - sudo apt-get install -y rpm
+      
+      # Get version from tag or generate
+      - name: get-rpm-version
+        script:
+          - |
+            if [[ "${SRC_GIT_REF_TYPE}" == "tag" && "${SRC_GIT_REF_NAME}" == v* ]]; then
+              VERSION=${SRC_GIT_REF_NAME#v}
+            else
+              VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+            fi
+            echo "VERSION=$VERSION" >> $SRC_ENV
+            echo "Version: $VERSION"
+      
+      # Build RPM package
+      - name: build-rpm-package
+        script:
+          - mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Copy files to SOURCES
+          - tar czf ~/rpmbuild/SOURCES/chromium-gost-updater-$VERSION.tar.gz \
+              --transform "s,^,chromium-gost-updater-$VERSION/," \
+              chromium-gost-updater.py \
+              chromium-gost-updater-wrapper.sh \
+              chromium-gost-updater.service \
+              chromium-gost-updater.service.system \
+              chromium-gost-remote.timer \
+              chromium-gost-updater.toml \
+              chromium-gost-logo.png \
+              README.md \
+              NOTICE.txt
+          # Copy spec file
+          - cp rpm/chromium-gost-updater.spec ~/rpmbuild/SPECS/
+          # Build RPM
+          - rpmbuild -ba \
+              --define "_version $VERSION" \
+              ~/rpmbuild/SPECS/chromium-gost-updater.spec
+          # Copy RPM to current directory for artifacts
+          - cp ~/rpmbuild/RPMS/*/*.rpm . || true
+      
+      # Upload RPM artifact
+      - name: upload-rpm-artifact
+        artifacts:
+          paths:
+            - "*.rpm"
+
+  # Task for creating release
+  - name: release-task
+    cubes:
+      # Download artifacts from previous tasks
+      # Note: In SourceCraft, artifacts are automatically available within the same workflow
+      # but we need to organize them properly
+      
+      # Get version from tag
+      - name: get-release-version
+        script:
+          - |
+            if [[ "${SRC_GIT_REF_TYPE}" == "tag" && "${SRC_GIT_REF_NAME}" == v* ]]; then
+              VERSION=${SRC_GIT_REF_NAME#v}
+              TAG_NAME=${SRC_GIT_REF_NAME}
+            else
+              VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+              TAG_NAME="release-$VERSION"
+            fi
+            echo "VERSION=$VERSION" >> $SRC_ENV
+            echo "TAG_NAME=$TAG_NAME" >> $SRC_ENV
+            echo "Version: $VERSION"
+            echo "Tag name: $TAG_NAME"
+      
+      # Create release with packages
+      - name: create-release
+        script:
+          - |
+            echo "Creating release for version $VERSION"
+            echo "Tag name: $TAG_NAME"
+            
+            # List available packages
+            echo "Available packages:"
+            ls -la *.deb *.rpm 2>/dev/null || echo "No packages found"
+            
+            # In SourceCraft, releases are created through the UI
+            # This cube would typically contain deployment logic
+            # For now, we'll just prepare the release information
+            
+            echo "Release preparation completed"
+            echo "Version: $VERSION" > release-info.txt
+            echo "Tag: $TAG_NAME" >> release-info.txt
+            echo "Packages:" >> release-info.txt
+            ls *.deb *.rpm 2>/dev/null >> release-info.txt || echo "No packages" >> release-info.txt
+      
+      # Upload release information
+      - name: upload-release-info
+        artifacts:
+          paths:
+            - "release-info.txt"
