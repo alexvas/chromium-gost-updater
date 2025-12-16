@@ -139,6 +139,8 @@ jobs:
     needs: [build-deb, build-rpm]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -175,7 +177,14 @@ jobs:
 
       - name: Delete existing release if present
         run: |
-          gh release delete "${{ steps.version.outputs.tag_name }}" --yes 2>/dev/null || echo "Release does not exist, will create new one"
+          echo "Checking for existing release: ${{ steps.version.outputs.tag_name }}"
+          if gh release view "${{ steps.version.outputs.tag_name }}" 2>/dev/null; then
+            echo "Release exists, deleting..."
+            gh release delete "${{ steps.version.outputs.tag_name }}" --yes
+            echo "Release deleted successfully"
+          else
+            echo "Release does not exist, will create new one"
+          fi
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
