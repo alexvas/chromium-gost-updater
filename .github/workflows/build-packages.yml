@@ -123,13 +123,16 @@ jobs:
           rpmbuild -ba \
             --define "_version ${{ steps.version.outputs.version }}" \
             ~/rpmbuild/SPECS/chromium-gost-updater.spec
+          # Копируем RPM в текущую директорию для upload-artifact
+          cp ~/rpmbuild/RPMS/*/chromium-gost-updater-*.rpm . || true
 
       - name: Upload RPM artifact
         uses: actions/upload-artifact@v4
         with:
           name: rpm-package
-          path: ~/rpmbuild/RPMS/*/chromium-gost-updater-*.rpm
+          path: chromium-gost-updater-*.rpm
           retention-days: 30
+          if-no-files-found: warn
 
   release:
     name: Create Release
@@ -151,12 +154,29 @@ jobs:
         with:
           name: rpm-package
           path: ./artifacts/rpm
+          if-no-files-found: ignore
 
       - name: Get version from tag
         id: version
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check files and prepare release
+        id: check_files
+        run: |
+          FILES=""
+          if ls artifacts/deb/*.deb 1> /dev/null 2>&1; then
+            FILES="${FILES}artifacts/deb/*.deb"$'\n'
+          fi
+          if ls artifacts/rpm/*.rpm 1> /dev/null 2>&1; then
+            FILES="${FILES}artifacts/rpm/*.rpm"$'\n'
+          fi
+          echo "files<<EOF" >> $GITHUB_OUTPUT
+          echo "$FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+          echo "Files to upload:"
+          echo "$FILES"
 
       - name: Create Release
         uses: softprops/action-gh-release@v1
@@ -180,11 +200,12 @@ jobs:
             wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
             sudo rpm -Uvh chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
             ```
-          files: |
-            artifacts/deb/*.deb
-            artifacts/rpm/*.rpm
+          files: ${{ steps.check_files.outputs.files }}
           draft: false
           prerelease: false
+          update: true
+          skip_if_exists: false
+          fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
