@@ -168,7 +168,12 @@ class Config():
     Настройки скрипта, завязанные на файл конфигурации, управляемый пользователем.
     """
     __delegate: dict[str, dict[str, str | int]] = {}
-    __CONFIG_PATH = HOME / ".chromium-gost-updater.toml"
+    # Проверяем системный конфиг, затем пользовательский
+    __CONFIG_PATH = (
+        Path("/etc/chromium-gost-updater.toml")
+        if Path("/etc/chromium-gost-updater.toml").exists()
+        else HOME / ".chromium-gost-updater.toml"
+    )
     __TMP_DIR = "/tmp/chromium-gost-updater"
     
 
@@ -808,9 +813,19 @@ class GuiBackend:
     def _find_icon_path(self) -> Path | None:
         """
         Найти путь к иконке приложения.
-        Проверяет текущую директорию, затем ~/.local/share/chromium-gost-updater/.
+        Проверяет системные пути (для deb/rpm пакетов), затем пользовательские.
         Возвращает Path к иконке или None, если не найдена.
         """
+        # Системные пути (для deb/rpm пакетов)
+        system_paths = [
+            Path("/usr/share/chromium-gost-updater/chromium-gost-logo.png"),
+            Path("/usr/local/share/chromium-gost-updater/chromium-gost-logo.png"),
+        ]
+        for path in system_paths:
+            if path.exists():
+                return path
+        
+        # Пользовательские пути (для ручной установки)
         # Prefer local icon file chromium-gost-logo.png in current dir
         icon_path = Path.cwd() / "chromium-gost-logo.png"
         if icon_path.exists():

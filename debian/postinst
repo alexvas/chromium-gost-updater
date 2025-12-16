@@ -1,0 +1,65 @@
+#!/bin/bash
+set -e
+
+# Функция для выполнения команд systemctl от имени пользователя
+run_user_systemctl() {
+    local username=$1
+    local cmd=$2
+    
+    # Используем su для выполнения команды от имени пользователя
+    # Это работает, если пользователь имеет активную сессию
+    if command -v su >/dev/null 2>&1; then
+        su - "$username" -c "$cmd" 2>/dev/null || return 1
+    fi
+    return 1
+}
+
+# Определяем активных пользователей и выполняем команды для каждого
+if command -v systemctl >/dev/null 2>&1; then
+    # Метод 1: Если установка через sudo, используем SUDO_USER (самый надёжный)
+    if [ -n "$SUDO_USER" ] && [ "$SUDO_USER" != "root" ]; then
+        run_user_systemctl "$SUDO_USER" "systemctl --user daemon-reload" || true
+        run_user_systemctl "$SUDO_USER" "systemctl --user enable chromium-gost-remote.timer" || true
+        run_user_systemctl "$SUDO_USER" "systemctl --user start chromium-gost-remote.timer" || true
+    fi
+    
+    # Метод 2: Используем loginctl для определения активных пользовательских сессий
+    if command -v loginctl >/dev/null 2>&1 && command -v getent >/dev/null 2>&1; then
+        # Получаем список активных сессий и обрабатываем каждую
+        loginctl list-sessions --no-legend 2>/dev/null | while read -r session uid user rest; do
+            # Получаем имя пользователя по UID
+            username=$(getent passwd "$uid" 2>/dev/null | cut -d: -f1)
+            
+            # Пропускаем root и системных пользователей
+            if [ -z "$username" ] || [ "$username" = "root" ] || [ "$uid" -lt 1000 ]; then
+                continue
+            fi
+            
+            # Выполняем команды от имени пользователя
+            run_user_systemctl "$username" "systemctl --user daemon-reload" || true
+            run_user_systemctl "$username" "systemctl --user enable chromium-gost-remote.timer" || true
+            run_user_systemctl "$username" "systemctl --user start chromium-gost-remote.timer" || true
+        done
+    fi
+    
+    # Метод 3: Перебираем всех пользователей с активными systemd user сессиями
+    # (fallback метод)
+    if command -v getent >/dev/null 2>&1; then
+        getent passwd | while IFS=: read -r username _ uid _ _ home _; do
+            # Пропускаем системных пользователей
+            if [ "$uid" -lt 1000 ] || [ "$username" = "root" ] || [ -z "$home" ]; then
+                continue
+            fi
+            
+            # Проверяем, есть ли активная systemd user сессия
+            if [ -S "/run/user/$uid/systemd/private" ] 2>/dev/null; then
+                run_user_systemctl "$username" "systemctl --user daemon-reload" || true
+                run_user_systemctl "$username" "systemctl --user enable chromium-gost-remote.timer" || true
+                run_user_systemctl "$username" "systemctl --user start chromium-gost-remote.timer" || true
+            fi
+        done
+    fi
+fi
+
+# Update alternatives или другие действия
+

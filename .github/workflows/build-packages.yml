@@ -1,0 +1,182 @@
+name: Build and Release Packages
+
+on:
+  push:
+    tags:
+      - 'v*'  # Запускается при создании тега вида v1.0.0
+  workflow_dispatch:  # Позволяет запускать вручную
+
+jobs:
+  build-deb:
+    name: Build DEB Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # Нужно для changelog
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential \
+            devscripts \
+            debhelper \
+            dh-python \
+            python3-all \
+            fakeroot
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Prepare debian directory
+        run: |
+          mkdir -p debian
+          # Генерируем changelog если его нет или обновляем версию
+          if [ ! -f debian/changelog ] || ! grep -q "^chromium-gost-updater (${{ steps.version.outputs.version }})" debian/changelog; then
+            dch --create --package chromium-gost-updater \
+                --newversion ${{ steps.version.outputs.version }} \
+                --distribution stable \
+                --controlmaint "Release ${{ steps.version.outputs.version }}"
+          fi
+
+      - name: Build DEB package
+        run: |
+          dpkg-buildpackage -us -uc -b
+          # Пакет будет в родительской директории
+
+      - name: Upload DEB artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deb-package
+          path: ../chromium-gost-updater_*.deb
+          retention-days: 30
+
+  build-rpm:
+    name: Build RPM Package
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y rpm
+
+      - name: Get version from tag
+        id: version
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            VERSION=${GITHUB_REF#refs/tags/v}
+          else
+            VERSION=$(date +%Y%m%d%H%M%S)-$(git rev-parse --short HEAD)
+          fi
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+          echo "Version: $VERSION"
+
+      - name: Build RPM package
+        run: |
+          mkdir -p ~/rpmbuild/{BUILD,RPMS,SOURCES,SPECS,SRPMS}
+          # Копируем файлы в SOURCES
+          tar czf ~/rpmbuild/SOURCES/chromium-gost-updater-${{ steps.version.outputs.version }}.tar.gz \
+            --transform "s,^,chromium-gost-updater-${{ steps.version.outputs.version }}/," \
+            chromium-gost-updater.py \
+            chromium-gost-updater-wrapper.sh \
+            chromium-gost-updater.service \
+            chromium-gost-updater.service.system \
+            chromium-gost-remote.timer \
+            chromium-gost-updater.toml \
+            chromium-gost-logo.png \
+            README.md \
+            NOTICE.txt
+          # Копируем spec файл
+          cp rpm/chromium-gost-updater.spec ~/rpmbuild/SPECS/
+          # Собираем RPM
+          rpmbuild -ba \
+            --define "_version ${{ steps.version.outputs.version }}" \
+            ~/rpmbuild/SPECS/chromium-gost-updater.spec
+
+      - name: Upload RPM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: rpm-package
+          path: ~/rpmbuild/RPMS/*/chromium-gost-updater-*.rpm
+          retention-days: 30
+
+  release:
+    name: Create Release
+    needs: [build-deb, build-rpm]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Download DEB artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: deb-package
+          path: ./artifacts/deb
+
+      - name: Download RPM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: rpm-package
+          path: ./artifacts/rpm
+
+      - name: Get version from tag
+        id: version
+        run: |
+          VERSION=${GITHUB_REF#refs/tags/v}
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        with:
+          tag_name: ${{ github.ref }}
+          name: Release ${{ steps.version.outputs.version }}
+          body: |
+            ## Chromium Gost Updater ${{ steps.version.outputs.version }}
+            
+            ### Установка
+            
+            **Debian/Ubuntu:**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
+            sudo dpkg -i chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
+            sudo apt-get install -f  # Установить зависимости если нужно
+            ```
+            
+            **RPM-based (Fedora/RHEL/CentOS):**
+            ```bash
+            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
+            sudo rpm -Uvh chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
+            ```
+          files: |
+            artifacts/deb/*.deb
+            artifacts/rpm/*.rpm
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+

@@ -6,10 +6,18 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 USER_HOME="$HOME"
-LOCAL_BIN="$USER_HOME/.local/bin"
+
+# Определяем путь к скрипту: сначала системные пути (для deb/rpm), затем пользовательские
+if [ -f "/usr/bin/chromium-gost-updater.py" ]; then
+    PYTHON_SCRIPT="/usr/bin/chromium-gost-updater.py"
+elif [ -f "$USER_HOME/.local/bin/chromium-gost-updater.py" ]; then
+    PYTHON_SCRIPT="$USER_HOME/.local/bin/chromium-gost-updater.py"
+else
+    PYTHON_SCRIPT="$SCRIPT_DIR/chromium-gost-updater.py"
+fi
+
 LOCAL_SHARE="$USER_HOME/.local/share/chromium-gost-updater"
 VENV_DIR="$LOCAL_SHARE/venv"
-PYTHON_SCRIPT="$LOCAL_BIN/chromium-gost-updater.py"
 
 # Function to check if a Python module is available
 check_python_module() {

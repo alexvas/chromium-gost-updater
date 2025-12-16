@@ -1,0 +1,25 @@
+Source: chromium-gost-updater
+Section: utils
+Priority: optional
+Maintainer: Обновлятор Chromium Gost <a.a.vasiljev+cgu@yandex.ru>
+Build-Depends: debhelper-compat (= 13), dh-python, python3-all
+Standards-Version: 4.6.0
+Homepage: https://github.com/alexvas/chromium-gost-updater
+
+Package: chromium-gost-updater
+Architecture: all
+Depends: ${python3:Depends}, ${misc:Depends},
+         python3-gi | python3-pyside6 | python3-pyqt5,
+         python3-toml | python3 (>= 3.11),
+         policykit-1,
+         systemd
+Recommends: chromium-gost-stable
+Description: Автоматический обновлятор браузера Chromium Gost сборки КриптоПро.
+ Питоновский скрипт приложения системного трея, который проверяет наличие обновлений 
+ и позволяет установить их через GUI-диалог.
+
+Возможности:
+ - Автоматическая проверка обновлений через systemd timer
+ - Иконка в трее (поддержка KDE/GNOME/Unity)
+ - Установка пакета по клику
+ 
