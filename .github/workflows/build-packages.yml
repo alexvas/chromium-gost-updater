@@ -175,7 +175,6 @@ jobs:
 
       - name: Delete existing release if present
         run: |
-          echo "${{ secrets.GITHUB_TOKEN }}" | gh auth login --with-token
           gh release delete "${{ steps.version.outputs.tag_name }}" --yes 2>/dev/null || echo "Release does not exist, will create new one"
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
