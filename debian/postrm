@@ -1,6 +1,8 @@
 #!/bin/bash
 set -e
 
+#DEBHELPER#
+
 # Функция для выполнения команд systemctl от имени пользователя
 run_user_systemctl() {
     local username=$1
