@@ -143,6 +143,11 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
+      - name: Setup GitHub CLI
+        uses: cli/cli@gh-action/v1
+        with:
+          version: latest
+
       - name: Download DEB artifact
         uses: actions/download-artifact@v4
         with:
@@ -161,6 +166,14 @@ jobs:
         run: |
           VERSION=${GITHUB_REF#refs/tags/v}
           echo "version=$VERSION" >> $GITHUB_OUTPUT
+          TAG_NAME=${GITHUB_REF#refs/tags/}
+          echo "tag_name=$TAG_NAME" >> $GITHUB_OUTPUT
+
+      - name: Delete existing release if present
+        run: |
+          gh release delete "${{ steps.version.outputs.tag_name }}" --yes 2>/dev/null || echo "Release does not exist, will create new one"
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check files and prepare release
         id: check_files
@@ -181,7 +194,7 @@ jobs:
       - name: Create Release
         uses: softprops/action-gh-release@v1
         with:
-          tag_name: ${{ github.ref }}
+          tag_name: ${{ steps.version.outputs.tag_name }}
           name: Release ${{ steps.version.outputs.version }}
           body: |
             ## Chromium Gost Updater ${{ steps.version.outputs.version }}
@@ -190,21 +203,19 @@ jobs:
             
             **Debian/Ubuntu:**
             ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag_name }}/chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
             sudo dpkg -i chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
             sudo apt-get install -f  # Установить зависимости если нужно
             ```
             
             **RPM-based (Fedora/RHEL/CentOS):**
             ```bash
-            wget https://github.com/${{ github.repository }}/releases/download/${{ github.ref_name }}/chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
+            wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag_name }}/chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
             sudo rpm -Uvh chromium-gost-updater-${{ steps.version.outputs.version }}-1.noarch.rpm
             ```
           files: ${{ steps.check_files.outputs.files }}
           draft: false
           prerelease: false
-          update: true
-          skip_if_exists: false
           fail_on_unmatched_files: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
