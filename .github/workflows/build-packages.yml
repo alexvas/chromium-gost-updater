@@ -46,12 +46,18 @@ jobs:
       - name: Prepare debian directory
         run: |
           mkdir -p debian
-          # Генерируем changelog если его нет или обновляем версию
-          if [ ! -f debian/changelog ] || ! grep -q "^chromium-gost-updater (${{ steps.version.outputs.version }})" debian/changelog; then
+          # Обновляем changelog с новой версией
+          if [ ! -f debian/changelog ]; then
+            # Создаём changelog если его нет
             dch --create --package chromium-gost-updater \
                 --newversion ${{ steps.version.outputs.version }} \
                 --distribution stable \
                 --controlmaint "Release ${{ steps.version.outputs.version }}"
+          elif ! grep -q "^chromium-gost-updater (${{ steps.version.outputs.version }})" debian/changelog; then
+            # Обновляем версию в существующем changelog
+            dch --newversion ${{ steps.version.outputs.version }} \
+                --distribution stable \
+                "Release ${{ steps.version.outputs.version }}"
           fi
 
       - name: Build DEB package
