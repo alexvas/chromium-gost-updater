@@ -11,13 +11,11 @@ override_dh_auto_install:
 	
 	install -d $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user
 	# Используем системный вариант service файла с путем /usr/bin/
-	if [ -f chromium-gost-updater.service.system ]; then
-		install -m 644 chromium-gost-updater.service.system $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service
-	else
-		# Fallback: используем обычный файл и заменяем путь
-		sed 's|%h/.local/bin/chromium-gost-updater-wrapper.sh|/usr/bin/chromium-gost-updater-wrapper.sh|' \
-			chromium-gost-updater.service > $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service
-		chmod 644 $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service
+	@if [ -f chromium-gost-updater.service.system ]; then \
+		install -m 644 chromium-gost-updater.service.system $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service; \
+	else \
+		sed 's|%h/.local/bin/chromium-gost-updater-wrapper.sh|/usr/bin/chromium-gost-updater-wrapper.sh|' chromium-gost-updater.service > $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service; \
+		chmod 644 $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/chromium-gost-updater.service; \
 	fi
 	install -m 644 chromium-gost-remote.timer $(CURDIR)/debian/chromium-gost-updater/usr/lib/systemd/user/
 	
