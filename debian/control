@@ -11,7 +11,7 @@ Architecture: all
 Depends: python3, ${misc:Depends},
          python3-gi | python3-pyside6 | python3-pyqt5,
          python3-toml | python3 (>= 3.11),
-         policykit-1,
+         polkitd | policykit-1,
          systemd
 Recommends: chromium-gost-stable
 Description: Автоматический обновлятор браузера Chromium Gost сборки КриптоПро.

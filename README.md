@@ -8,7 +8,7 @@
 Можно пользоваться на свой страх и риск. Апач 2.0. Подробнее и зануднее в [NOTICE.txt](NOTICE.txt)
 
 ## 2. Установка из Deb или Rpm пакета (рекомендуется)
-Забираете пакет с [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете.
+Забираете пакет с обновлятором из [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете.
 
 
 Идея в том, что скрипт-обновлятор меняется редко, а браузер — часто. Установите скрипт один раз, и тот будет следить за обновлениями браузера Chromium Gost [на сайте КриптоПро](https://update.cryptopro.ru/chromium-gost/).
