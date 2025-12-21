@@ -8,10 +8,35 @@
 Можно пользоваться на свой страх и риск. Апач 2.0. Подробнее и зануднее в [NOTICE.txt](NOTICE.txt)
 
 ## 2. Установка из Deb или Rpm пакета (рекомендуется)
-Забираете пакет с обновлятором из [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете.
-
 
 Идея в том, что скрипт-обновлятор меняется редко, а браузер — часто. Установите скрипт один раз, и тот будет следить за обновлениями браузера Chromium Gost [на сайте КриптоПро](https://update.cryptopro.ru/chromium-gost/).
+
+### Из-под администратора
+
+Забираете пакет с обновлятором из [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете через `sudo`:
+
+#### Debian/Ubuntu:
+
+```bash
+CGU_VER=<номер_последней_версии>
+wget "https://github.com/alexvas/chromium-gost-updater/releases/download/v${CGU_VER}/chromium-gost-updater_${CGU_VER}_all.deb"
+sudo "dpkg -i chromium-gost-updater_${CGU_VER}_all.deb"
+sudo apt-get install -f  # Установить зависимости, если нужно
+```
+
+#### RPM-based (Fedora/RHEL/CentOS):
+
+```bash
+wget https://github.com/alexvas/chromium-gost-updater/releases/download/v1.0.13/chromium-gost-updater-1.0.13-1.noarch.rpm
+sudo rpm -Uvh chromium-gost-updater-1.0.13-1.noarch.rpm
+```
+
+### Из-под пользователя, кому показывать уведомления
+
+```bash
+systemctl --user enable chromium-gost-remote.timer
+systemctl --user start chromium-gost-remote.timer
+```
 
 ## 3. Полуавтоматическая установка из исходников.
 
