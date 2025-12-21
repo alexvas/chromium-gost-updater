@@ -11,9 +11,9 @@
 
 Идея в том, что скрипт-обновлятор меняется редко, а браузер — часто. Установите скрипт один раз, и тот будет следить за обновлениями браузера Chromium Gost [на сайте КриптоПро](https://update.cryptopro.ru/chromium-gost/).
 
-### Из-под администратора
+### Установка пакета
 
-Забираете пакет с обновлятором из [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете через `sudo`:
+Скачиваете пакет с обновлятором из [Github Releases](https://github.com/alexvas/chromium-gost-updater/releases) и устанавливаете через `sudo`:
 
 #### Debian/Ubuntu:
 
@@ -27,11 +27,14 @@ sudo apt-get install -f  # Установить зависимости, если
 #### RPM-based (Fedora/RHEL/CentOS):
 
 ```bash
-wget https://github.com/alexvas/chromium-gost-updater/releases/download/v1.0.13/chromium-gost-updater-1.0.13-1.noarch.rpm
-sudo rpm -Uvh chromium-gost-updater-1.0.13-1.noarch.rpm
+CGU_VER=<номер_последней_версии>
+wget "https://github.com/alexvas/chromium-gost-updater/releases/download/v${CGU_VER}/chromium-gost-updater-${CGU_VER}-1.noarch.rpm"
+sudo "rpm -Uvh chromium-gost-updater-${CGU_VER}-1.noarch.rpm"
 ```
 
-### Из-под пользователя, кому показывать уведомления
+### Настройка уведомлений
+
+Из-под пользователя, кому показывать уведомления, настраиваете периодический запуск скрипта.
 
 ```bash
 systemctl --user enable chromium-gost-remote.timer
