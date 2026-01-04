@@ -2,6 +2,7 @@
 
 [download]
 retries = 5
+keep_cached_distributive_in_days = 30
 
 [auth]
 password_attempts = 3

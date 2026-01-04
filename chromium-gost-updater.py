@@ -267,6 +267,12 @@ class Config:
         """
         return self.__int_or_default("timing", "check_remote_interval", 3600)
 
+    def keep_cached_distributive_in_days(self) -> int:
+        """
+        Возвращаем количество дней, в течение которых хранить кэшированные дистрибутивы.
+        """
+        return self.__int_or_default("download", "keep_cached_distributive_in_days", 30)
+
 
 CONFIG: Config = Config()
 
@@ -693,10 +699,13 @@ class Downloader:
         log_debug(f"cache: found valid cached file {filename} for version {version}")
         return cached_file
 
-    def cleanup_old_cache_files(self, max_age_days: int = 30) -> None:
+    def cleanup_old_cache_files(self, max_age_days: int | None = None) -> None:
         """
         Удалить файлы из кэша, которые старше max_age_days дней.
+        Если max_age_days не указан, используется значение из конфига.
         """
+        if max_age_days is None:
+            max_age_days = CONFIG.keep_cached_distributive_in_days()
         manifest = self._load_cache_manifest()
         packages = manifest.get("packages", {})
         if not packages:
@@ -859,9 +868,9 @@ def cleanup_old_package_files(keep_current: str | None = None) -> None:
     Remove old package files (.deb or .rpm) from tmp_dir, optionally keeping the current one.
     Также очищает старые файлы из кэш-директории (старше месяца).
     """
-    # Очистка старых файлов из кэша (старше месяца)
+    # Очистка старых файлов из кэша (используется значение из конфига)
     try:
-        DOWNLOADER.cleanup_old_cache_files(max_age_days=30)
+        DOWNLOADER.cleanup_old_cache_files()
     except Exception as e:
         log_debug(f"cleanup_old_package_files: failed to cleanup cache: {e}")
 
@@ -2099,7 +2108,7 @@ def main() -> None:
     cleanup_old_package_files()
     # Очистка старых файлов из кэша при периодических запусках
     try:
-        DOWNLOADER.cleanup_old_cache_files(max_age_days=30)
+        DOWNLOADER.cleanup_old_cache_files()
         log_debug("main: cache cleanup completed")
     except Exception as e:
         log_debug(f"main: cache cleanup failed: {e}")
