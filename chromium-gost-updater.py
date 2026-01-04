@@ -1078,13 +1078,14 @@ class QtBackend(GuiBackend):
 
         log_debug(f"show_update_dialog: is_main_thread={is_main_thread}")
         if is_main_thread:
-            # Вызываем напрямую, так как мы в главном потоке
+            # Вызываем напрямую, так как мы в главном потоке (клик по иконке tray)
             log_debug(
                 f"show_update_dialog: calling _show_update_dialog_impl directly from main thread"
             )
             self.__show_update_dialog_impl(updater_app)
         else:
             # Вызываем из главного потока через сигнал Qt
+            # (попали сюда из меню "Проверить сейчас" или через автопоказ диалога для AppIndicator)
             log_debug(
                 f"show_update_dialog: scheduling dialog in main thread via Qt signal"
             )
