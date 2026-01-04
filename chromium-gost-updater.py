@@ -103,6 +103,8 @@ APPNAME = "Chromium Gost Updater"
 PACKAGE_NAME = "chromium-gost-stable"
 HOME = Path.home()
 CACHE_DIR = HOME / ".cache" / "chromium_gost_updater"
+CACHE_PACKAGES_DIR = CACHE_DIR / "packages"
+CACHE_MANIFEST_FILE = CACHE_PACKAGES_DIR / "cache.toml"
 STATE_FILE = CACHE_DIR / "state.json"
 LOCK_FILE = CACHE_DIR / "gui_instance.lock"
 LOG_FILE = Path("/tmp/chromium-gost-updater.log")
@@ -513,6 +515,175 @@ class Downloader:
     PACKAGE_DOWNLOAD_URL_TEMPLATE = "https://update.cryptopro.ru/chromium-gost/chromium-gost-{{version}}-linux-amd64.{{extension}}"
     HEADERS = {"User-Agent": "chromium-gost-updater/1.0"}
 
+    def _get_cache_dir(self) -> Path:
+        """Получить путь к директории кэша пакетов."""
+        cache_dir = CACHE_PACKAGES_DIR
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        return cache_dir
+
+    def _get_cache_manifest_path(self) -> Path:
+        """Получить путь к файлу манифеста кэша."""
+        return CACHE_MANIFEST_FILE
+
+    def _load_cache_manifest(self) -> dict:
+        """Загрузить манифест кэша из toml файла."""
+        manifest_path = self._get_cache_manifest_path()
+        if not manifest_path.exists():
+            return {"packages": {}}
+
+        # Try tomllib (py3.11), else toml (pip), else empty dict
+        try:
+            import tomllib as toml_loader  # Python 3.11+
+        except Exception:
+            try:
+                import toml as toml_loader  # type: ignore[import] -- pip install toml
+            except Exception:
+                log_debug("cache: toml loader not available, returning empty manifest")
+                return {"packages": {}}
+
+        try:
+            # tomllib (Python 3.11+) требует бинарный режим
+            # toml (pip) может работать с обоими режимами, но предпочтительно бинарный
+            try:
+                with manifest_path.open("rb") as f:
+                    data = toml_loader.load(f)
+            except (TypeError, AttributeError):
+                # Fallback для старых версий toml (pip), которые требуют текстовый режим
+                with manifest_path.open("r", encoding="utf-8") as f:
+                    data = toml_loader.load(f)
+            return data if isinstance(data, dict) else {"packages": {}}
+        except Exception as e:
+            log_debug(f"cache: failed to load manifest: {e}")
+            return {"packages": {}}
+
+    def _save_cache_manifest(self, manifest: dict) -> None:
+        """Сохранить манифест кэша в toml файл."""
+        manifest_path = self._get_cache_manifest_path()
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Try tomllib (py3.11), else toml (pip)
+        try:
+            import tomllib as toml_loader  # Python 3.11+
+
+            # tomllib не имеет метода dump, используем toml
+            import toml as toml_dumper  # type: ignore[import]
+        except Exception:
+            try:
+                import toml as toml_dumper  # type: ignore[import] -- pip install toml
+            except Exception:
+                log_debug("cache: toml dumper not available, cannot save manifest")
+                return
+
+        try:
+            with manifest_path.open("w", encoding="utf-8") as f:
+                toml_dumper.dump(manifest, f)
+            log_debug(f"cache: manifest saved to {manifest_path}")
+        except Exception as e:
+            log_debug(f"cache: failed to save manifest: {e}")
+
+    def _check_cache(self, version: str, extension: str) -> Path | None:
+        """
+        Проверить наличие файла в кэше.
+        Возвращает путь к файлу, если он есть и валиден, иначе None.
+        """
+        manifest = self._load_cache_manifest()
+        packages = manifest.get("packages", {})
+
+        if version not in packages:
+            log_debug(f"cache: version {version} not found in manifest")
+            return None
+
+        package_info = packages[version]
+        if not isinstance(package_info, dict):
+            log_debug(f"cache: invalid package info for version {version}")
+            return None
+
+        filename = package_info.get("file")
+        if not filename:
+            log_debug(f"cache: no filename in package info for version {version}")
+            return None
+
+        cache_dir = self._get_cache_dir()
+        cached_file = cache_dir / filename
+
+        if not cached_file.exists():
+            log_debug(f"cache: file {filename} not found in cache directory")
+            return None
+
+        # Проверяем размер файла
+        expected_size = package_info.get("size")
+        if expected_size:
+            actual_size = cached_file.stat().st_size
+            if actual_size != expected_size:
+                log_debug(
+                    f"cache: size mismatch for {filename}: expected {expected_size}, got {actual_size}"
+                )
+                return None
+
+        log_debug(f"cache: found valid cached file {filename} for version {version}")
+        return cached_file
+
+    def cleanup_old_cache_files(self, max_age_days: int = 30) -> None:
+        """
+        Удалить файлы из кэша, которые старше max_age_days дней.
+        """
+        manifest = self._load_cache_manifest()
+        packages = manifest.get("packages", {})
+        if not packages:
+            return
+
+        cache_dir = self._get_cache_dir()
+        current_time = time.time()
+        max_age_seconds = max_age_days * 24 * 60 * 60
+        removed_count = 0
+
+        packages_to_remove = []
+        for version, package_info in list(packages.items()):
+            if not isinstance(package_info, dict):
+                continue
+
+            downloaded_at_str = package_info.get("downloaded_at")
+            if not downloaded_at_str:
+                # Если нет даты, считаем файл старым
+                packages_to_remove.append(version)
+                continue
+
+            try:
+                # Парсим дату в формате ISO (например, "2024-01-01T12:00:00")
+                downloaded_at = datetime.fromisoformat(downloaded_at_str).timestamp()
+                age_seconds = current_time - downloaded_at
+
+                if age_seconds > max_age_seconds:
+                    packages_to_remove.append(version)
+                    log_debug(
+                        f"cache: marking version {version} for removal (age: {age_seconds / 86400:.1f} days)"
+                    )
+            except Exception as e:
+                log_debug(f"cache: failed to parse date for version {version}: {e}")
+                packages_to_remove.append(version)
+
+        # Удаляем файлы и записи из манифеста
+        for version in packages_to_remove:
+            package_info = packages.get(version)
+            if isinstance(package_info, dict):
+                filename = package_info.get("file")
+                if filename:
+                    file_path = cache_dir / filename
+                    try:
+                        if file_path.exists():
+                            file_path.unlink()
+                            log_debug(f"cache: removed old file {filename}")
+                            removed_count += 1
+                    except Exception as e:
+                        log_debug(f"cache: failed to remove file {filename}: {e}")
+
+            del packages[version]
+
+        if packages_to_remove:
+            manifest["packages"] = packages
+            self._save_cache_manifest(manifest)
+            log_debug(f"cache: cleanup completed, removed {removed_count} old files")
+
     def get_remote_version(self) -> str | None:
         """
         Запрашиваем удалённую версию (строка вида "142.0.7444.176")
@@ -533,24 +704,60 @@ class Downloader:
     def download_package(self, version: str) -> Path | None:
         """
         Загружаем пакет (.deb or .rpm) с повторами.
+        Сначала проверяем кэш, если файл есть и валиден - используем его.
         Возвращаем путь к загруженному файлу или None, если не удалось.
         """
-        out_dir = CONFIG.tmp_dir()
         ext = PACKAGE_MANAGER.get_extension()
+
+        # Проверяем кэш перед скачиванием
+        cached_file = self._check_cache(version, ext)
+        if cached_file:
+            log_debug(f"cache: using cached file for version {version}")
+            return cached_file
+
+        # Если файла нет в кэше, скачиваем в кэш-директорию
+        cache_dir = self._get_cache_dir()
         url = self.PACKAGE_DOWNLOAD_URL_TEMPLATE.replace(
             "{{version}}", version
         ).replace("{{extension}}", ext)
         filename = url.split("/")[-1]
-        dest = out_dir / filename
+        dest = cache_dir / filename
+
+        log_debug(f"cache: downloading {version} to cache directory")
         attempt = 0
         retries = self.get_retries_count()
         while attempt < retries:
             attempt += 1
             try:
-                return self.__do_download_package(url, dest)
-            except Exception:
+                downloaded_file = self.__do_download_package(url, dest)
+                if downloaded_file:
+                    # Регистрируем файл в манифесте кэша
+                    self._register_in_cache(version, filename, downloaded_file)
+                    return downloaded_file
+            except Exception as e:
+                log_debug(f"cache: download attempt {attempt} failed: {e}")
                 time.sleep(2 ** min(attempt, 5))
         return None
+
+    def _register_in_cache(self, version: str, filename: str, file_path: Path) -> None:
+        """Зарегистрировать скачанный файл в манифесте кэша."""
+        manifest = self._load_cache_manifest()
+        packages = manifest.setdefault("packages", {})
+
+        file_size = file_path.stat().st_size
+        downloaded_at = datetime.now().isoformat()
+
+        packages[version] = {
+            "file": filename,
+            "downloaded_at": downloaded_at,
+            "size": file_size,
+        }
+
+        manifest["packages"] = packages
+        self._save_cache_manifest(manifest)
+        log_debug(
+            f"cache: registered version {version} in manifest (file: {filename}, size: {file_size})"
+        )
 
     def __do_download_package(self, url: str, dest: Path) -> Path | None:
         req = Request(url, headers=self.HEADERS)
@@ -580,7 +787,15 @@ DOWNLOADER: Downloader = Downloader()
 def cleanup_old_package_files(keep_current: str | None = None) -> None:
     """
     Remove old package files (.deb or .rpm) from tmp_dir, optionally keeping the current one.
+    Также очищает старые файлы из кэш-директории (старше месяца).
     """
+    # Очистка старых файлов из кэша (старше месяца)
+    try:
+        DOWNLOADER.cleanup_old_cache_files(max_age_days=30)
+    except Exception as e:
+        log_debug(f"cleanup_old_package_files: failed to cleanup cache: {e}")
+
+    # Очистка старых файлов из tmp_dir (для обратной совместимости)
     tmp_dir = CONFIG.tmp_dir()
     if not tmp_dir.exists():
         return
@@ -597,6 +812,9 @@ def cleanup_old_package_files(keep_current: str | None = None) -> None:
             continue
         try:
             pkg_file.unlink()
+            log_debug(
+                f"cleanup_old_package_files: removed old file from tmp_dir: {pkg_file.name}"
+            )
         except Exception:
             pass
 
@@ -1757,8 +1975,14 @@ class UpdaterAppImpl(UpdaterApp):
 def main() -> None:
     log_debug(f"=== Starting {APPNAME} ===")
     log_debug(f"Session ID: {SESSION_ID}, PID: {os.getpid()}, Args: {sys.argv}")
-    # Cleanup old package files on startup
+    # Cleanup old package files on startup (including cache cleanup)
     cleanup_old_package_files()
+    # Очистка старых файлов из кэша при периодических запусках
+    try:
+        DOWNLOADER.cleanup_old_cache_files(max_age_days=30)
+        log_debug("main: cache cleanup completed")
+    except Exception as e:
+        log_debug(f"main: cache cleanup failed: {e}")
     updater = UpdaterAppImpl()
     updater.check_package_versions()
     # Очищаем уже установленную версию из ignored_versions и remind_at
