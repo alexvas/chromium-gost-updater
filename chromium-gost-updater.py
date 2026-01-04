@@ -334,22 +334,86 @@ class PackageManager:
             return parts[0]
         return input
 
-    def install(self, package_path: str) -> tuple[bool, str]:
+    def install(
+        self, package_path: str, gui_env_vars: dict[str, str] | None = None
+    ) -> tuple[bool, str]:
         """
         Используем pkexec, чтобы запустить сформированную команду установки.
         pkexec работает в KDE, GNOME и Unity, но для показа GUI диалога требуется
         запущенный агент аутентификации Polkit (polkit-kde-authentication-agent-1
         для KDE, polkit-gnome-authentication-agent-1 для GNOME/Unity).
+
+        Args:
+            package_path: путь к пакету для установки
+            gui_env_vars: словарь с переменными окружения GUI (DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS),
+                         захваченными в главном потоке. Если None, пытается получить из окружения или systemctl.
+
         Returns (success: bool, combined_output: str)
         """
         # Передаем DISPLAY и XAUTHORITY через окружение процесса, а не через команду
         # Это позволяет pkexec показать GUI диалог, но команда в диалоге будет чистой
         env = os.environ.copy()
 
+        # Используем переданные переменные окружения GUI (захваченные в главном потоке)
+        # или пытаемся получить их из текущего окружения/systemctl
+        if gui_env_vars:
+            display = gui_env_vars.get("DISPLAY")
+            xauthority = gui_env_vars.get("XAUTHORITY")
+            dbus_session = gui_env_vars.get("DBUS_SESSION_BUS_ADDRESS")
+            log_debug(f"install: using GUI env vars from main thread")
+        else:
+            display = env.get("DISPLAY")
+            xauthority = env.get("XAUTHORITY")
+            dbus_session = env.get("DBUS_SESSION_BUS_ADDRESS")
+
+        # Если переменные не найдены, пытаемся получить их через systemctl
+        if not display or not xauthority:
+            try:
+                result = subprocess.run(
+                    ["systemctl", "--user", "show-environment"],
+                    capture_output=True,
+                    text=True,
+                    timeout=2,
+                )
+                if result.returncode == 0:
+                    for line in result.stdout.splitlines():
+                        if line.startswith("DISPLAY=") and not display:
+                            display = line.split("=", 1)[1]
+                            log_debug(f"install: got DISPLAY from systemctl: {display}")
+                        elif line.startswith("XAUTHORITY=") and not xauthority:
+                            xauthority = line.split("=", 1)[1]
+                            log_debug(
+                                f"install: got XAUTHORITY from systemctl: {xauthority}"
+                            )
+                        elif (
+                            line.startswith("DBUS_SESSION_BUS_ADDRESS=")
+                            and not dbus_session
+                        ):
+                            dbus_session = line.split("=", 1)[1]
+                            log_debug(
+                                f"install: got DBUS_SESSION_BUS_ADDRESS from systemctl"
+                            )
+            except Exception as e:
+                log_debug(f"install: failed to get env vars from systemctl: {e}")
+
+        # Устанавливаем переменные в окружение для pkexec
+        if display:
+            env["DISPLAY"] = display
+        if xauthority:
+            env["XAUTHORITY"] = xauthority
+        if dbus_session:
+            env["DBUS_SESSION_BUS_ADDRESS"] = dbus_session
+
+        # Логируем переменные окружения для отладки
+        log_debug(
+            f"install: DISPLAY={display}, XAUTHORITY={xauthority}, DBUS_SESSION_BUS_ADDRESS={'set' if dbus_session else 'not set'}"
+        )
+
         # Объединяем обе команды в один вызов pkexec через sh -c
         # Команда в диалоге будет: sh -c "dpkg -i ... && apt -f install -y"
         # Используем shlex.quote для безопасного экранирования пути
         cmd = ["pkexec"] + self._create_install_command(package_path)
+        log_debug(f"install: executing pkexec command: {' '.join(cmd)}")
         try:
             proc = subprocess.run(
                 cmd,
@@ -361,8 +425,14 @@ class PackageManager:
             )
             output = proc.stdout + "\n" + proc.stderr
             success = proc.returncode == 0
+            log_debug(
+                f"install: pkexec returned code {proc.returncode}, success={success}"
+            )
+            if not success:
+                log_debug(f"install: pkexec output: {output[:500]}")
             return success, output
         except Exception as e:
+            log_debug(f"install: exception during pkexec execution: {e}")
             return False, str(e)
 
     @classmethod
@@ -1348,6 +1418,9 @@ class QtBackend(GuiBackend):
         )
         if clicked == update_btn:
             log_debug(f"_show_update_dialog_impl: user clicked Update")
+            # Обновляем переменные окружения GUI перед запуском потока
+            if hasattr(updater_app, "_capture_gui_env_vars"):
+                updater_app._gui_env_vars = updater_app._capture_gui_env_vars()
             threading.Thread(target=updater_app.do_update, daemon=True).start()
         elif clicked == ignore_btn:
             log_debug(f"_show_update_dialog_impl: user clicked Ignore")
@@ -1642,6 +1715,9 @@ class AppIndicatorGuiBackend(GuiBackend):
 
         if response == Gtk.ResponseType.ACCEPT:
             log_debug(f"show_update_dialog: user clicked Update")
+            # Обновляем переменные окружения GUI перед запуском потока
+            if hasattr(updater_app, "_capture_gui_env_vars"):
+                updater_app._gui_env_vars = updater_app._capture_gui_env_vars()
             threading.Thread(target=updater_app.do_update, daemon=True).start()
         elif response == Gtk.ResponseType.HELP:
             log_debug(f"show_update_dialog: user clicked Changelog")
@@ -1775,6 +1851,45 @@ class UpdaterAppImpl(UpdaterApp):
         self.state.setdefault("ignored_versions", [])
         self.state.setdefault("remind_at", {})
         self.current_package_versions = PackageVersions()
+        # Сохраняем переменные окружения GUI при инициализации (в главном потоке)
+        self._gui_env_vars = self._capture_gui_env_vars()
+
+    def _capture_gui_env_vars(self) -> dict[str, str]:
+        """Захватить переменные окружения GUI из текущего контекста."""
+        env_vars = {}
+        for key in ["DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"]:
+            value = os.environ.get(key)
+            if value:
+                env_vars[key] = value
+                log_debug(f"_capture_gui_env_vars: captured {key}={value}")
+        return env_vars
+
+    def _get_gui_env_vars(self) -> dict[str, str]:
+        """Получить сохраненные переменные окружения GUI или попытаться получить их заново."""
+        if self._gui_env_vars:
+            return self._gui_env_vars.copy()
+
+        # Если переменные не были захвачены, пытаемся получить их через systemctl
+        env_vars = {}
+        try:
+            result = subprocess.run(
+                ["systemctl", "--user", "show-environment"],
+                capture_output=True,
+                text=True,
+                timeout=2,
+            )
+            if result.returncode == 0:
+                for line in result.stdout.splitlines():
+                    if line.startswith("DISPLAY="):
+                        env_vars["DISPLAY"] = line.split("=", 1)[1]
+                    elif line.startswith("XAUTHORITY="):
+                        env_vars["XAUTHORITY"] = line.split("=", 1)[1]
+                    elif line.startswith("DBUS_SESSION_BUS_ADDRESS="):
+                        env_vars["DBUS_SESSION_BUS_ADDRESS"] = line.split("=", 1)[1]
+        except Exception as e:
+            log_debug(f"_get_gui_env_vars: failed to get from systemctl: {e}")
+
+        return env_vars
 
     def check_package_versions(self) -> PackageVersions:
         local = PACKAGE_MANAGER.get_local_version()
@@ -1902,9 +2017,14 @@ class UpdaterAppImpl(UpdaterApp):
             return
         GUI_BACKEND.show_tray_message("Файл скачан, запрашиваю права администратора...")
         attempts = CONFIG.auth_password_attempts()
+        # Получаем переменные окружения GUI для передачи в install()
+        gui_env_vars = self._get_gui_env_vars()
+        log_debug(
+            f"do_update: passing GUI env vars to install: {list(gui_env_vars.keys())}"
+        )
         for attempt in range(1, attempts + 1):
             # Determine package type by extension or package manager
-            ok, out = PACKAGE_MANAGER.install(package_path)
+            ok, out = PACKAGE_MANAGER.install(package_path, gui_env_vars=gui_env_vars)
             if ok:
                 GUI_BACKEND.show_tray_message(f"Установлено {remote_version}", 5000)
                 # Cleanup old package files after successful installation
