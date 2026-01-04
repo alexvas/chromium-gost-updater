@@ -148,7 +148,7 @@ makensis /DVERSION=1.0.0 /DOUTPUT=installer.exe /DDISTDIR=dist windows/chromium-
 
 ## Структура файлов
 
-- `.github/workflows/build-packages.yml` - GitHub Actions workflow для автоматической сборки
+- `.github/workflows/ci.yml` - GitHub Actions workflow для автоматической сборки
 - `debian/` - файлы для сборки DEB пакета
   - `control` - метаданные пакета и зависимости
   - `changelog` - история изменений

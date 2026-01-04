@@ -1,4 +1,4 @@
-name: Build and Release Packages
+name: Сборка и релиз пакетов DEB, RPM и Windows portable.
 
 on:
   push:
@@ -158,57 +158,17 @@ jobs:
           echo "version=$VERSION" >> $GITHUB_OUTPUT
           echo "Version: $VERSION"
 
-      - name: Install PyInstaller
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install pyinstaller
-
       - name: Install dependencies
         run: |
+          python -m pip install --upgrade pip
           python -m pip install -r windows/requirements-windows.txt
 
-      - name: Build Windows package with PyInstaller
+      - name: Build Windows portable package
         shell: pwsh
         run: |
           $ErrorActionPreference = "Stop"
           $Version = "${{ steps.version.outputs.version }}"
-          $MainScript = "chromium-gost-updater.py"
-          $IconPath = "chromium-gost-logo.png"
-          
-          $PyInstallerArgs = @(
-            "--name=chromium-gost-updater",
-            "--onefile",
-            "--windowed",
-            "--clean",
-            "--noconfirm"
-          )
-          
-          if (Test-Path $IconPath) {
-            $PyInstallerArgs += "--icon=$IconPath"
-          }
-          
-          # Добавляем данные
-          $PyInstallerArgs += "--add-data=`"chromium-gost-updater.toml;.`""
-          if (Test-Path $IconPath) {
-            $PyInstallerArgs += "--add-data=`"chromium-gost-logo.png;.`""
-          }
-          
-          python -m PyInstaller $PyInstallerArgs $MainScript
-          
-          # Копируем дополнительные файлы
-          New-Item -ItemType Directory -Path "dist-windows" -Force | Out-Null
-          Copy-Item "dist\chromium-gost-updater.exe" "dist-windows\"
-          Copy-Item "chromium-gost-updater.toml" "dist-windows\" -ErrorAction SilentlyContinue
-          Copy-Item "chromium-gost-logo.png" "dist-windows\" -ErrorAction SilentlyContinue
-          Copy-Item "README.md" "dist-windows\" -ErrorAction SilentlyContinue
-          Copy-Item "NOTICE.txt" "dist-windows\" -ErrorAction SilentlyContinue
-
-      - name: Create ZIP archive
-        shell: pwsh
-        run: |
-          $Version = "${{ steps.version.outputs.version }}"
-          $ZipName = "chromium-gost-updater-${Version}-windows.zip"
-          Compress-Archive -Path "dist-windows\*" -DestinationPath $ZipName -Force
+          & .\windows\build-windows.ps1 -Version $Version -BuildType "portable"
 
       - name: Upload Windows artifact
         uses: actions/upload-artifact@v4
@@ -320,8 +280,8 @@ jobs:
             ```
             
             **Windows:**
-            Скачайте ZIP-архив, распакуйте и запустите `chromium-gost-updater.exe`.
-            Все зависимости (Python, Qt) включены в исполняемый файл.
+            Скачайте ZIP-архив, распакуйте и запустите `chromium-gost-updater.bat`.
+            Все зависимости (Python 3.11+, Qt/PySide6) включены в portable-версию.
           files: ${{ steps.check_files.outputs.files }}
           draft: false
           prerelease: false
