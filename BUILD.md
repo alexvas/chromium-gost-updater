@@ -15,7 +15,7 @@
    ```
 
 2. GitHub Actions автоматически:
-   - Соберёт DEB и RPM пакеты
+   - Соберёт DEB, RPM и Windows пакеты
    - Создаст или обновит Release на GitHub (если релиз уже существует, он будет обновлён)
    - Загрузит пакеты в GitHub Releases
 
@@ -94,6 +94,58 @@ rpmbuild -ba --define "_version ${VERSION}" ~/rpmbuild/SPECS/chromium-gost-updat
 # Пакет будет в: ~/rpmbuild/RPMS/noarch/chromium-gost-updater-${VERSION}-1.noarch.rpm
 ```
 
+### Сборка Windows-дистрибутива
+
+#### Автоматическая сборка через PowerShell скрипт
+
+```powershell
+# Убедитесь, что установлены Python 3.11+ и pip
+python --version
+
+# Запустите скрипт сборки
+cd windows
+.\build-windows.ps1 -Version "1.0.0" -BuildType "portable"
+```
+
+Скрипт создаст:
+- `dist-windows/chromium-gost-updater-1.0.0-windows.zip` - ZIP-архив с portable-версией
+
+Для создания установщика (требуется NSIS):
+```powershell
+.\build-windows.ps1 -Version "1.0.0" -BuildType "installer"
+```
+
+**Зависимости для Windows:**
+- Python 3.11 или новее (используется Python embeddable, встроен в дистрибутив)
+- PySide6 (GUI библиотека, автоматически устанавливается через requirements-windows.txt)
+- tomllib (встроен в Python 3.11+, внешняя библиотека toml не требуется)
+
+Все зависимости включаются в portable-версию с Python embeddable.
+
+#### Структура portable-версии
+
+После сборки в ZIP-архиве:
+- `chromium-gost-updater.bat` - главный launcher
+- `chromium-gost-updater.py` - основной скрипт
+- `chromium-gost-updater.toml` - конфиг
+- `python/` - Python embeddable 3.11+ с зависимостями
+- `install-task-scheduler.ps1` - скрипт установки задачи Task Scheduler
+- Документация и иконка
+
+#### Создание установщика с NSIS (опционально)
+
+1. Установите NSIS с https://nsis.sourceforge.io/
+2. Используйте скрипт `build-windows.ps1` с параметром `-BuildType "installer"`
+3. Или скомпилируйте вручную:
+```powershell
+makensis /DVERSION=1.0.0 /DOUTPUT=installer.exe /DDISTDIR=dist windows/chromium-gost-updater.nsi
+```
+
+Установщик автоматически:
+- Установит файлы в `%LOCALAPPDATA%\chromium-gost-updater`
+- Создаст ярлык в меню Пуск
+- Зарегистрирует задачу Task Scheduler для автоматической проверки обновлений
+
 ## Структура файлов
 
 - `.github/workflows/build-packages.yml` - GitHub Actions workflow для автоматической сборки
@@ -105,6 +157,11 @@ rpmbuild -ba --define "_version ${VERSION}" ~/rpmbuild/SPECS/chromium-gost-updat
   - `postrm` - скрипт после удаления
 - `rpm/chromium-gost-updater.spec` - спецификация для сборки RPM пакета
 - `chromium-gost-updater.service.system` - systemd service файл для системной установки
+- `windows/` - файлы для сборки Windows-дистрибутива
+  - `build-windows.ps1` - PowerShell скрипт для сборки portable-версии
+  - `install-task-scheduler.ps1` - скрипт установки задачи Task Scheduler
+  - `chromium-gost-updater.nsi` - NSIS скрипт для установщика
+  - `requirements-windows.txt` - зависимости Python для Windows (PySide6)
 
 ## Установка собранных пакетов
 
@@ -118,6 +175,21 @@ sudo apt-get install -f  # Установить зависимости если 
 ```bash
 sudo rpm -Uvh chromium-gost-updater-1.0.0-1.noarch.rpm
 ```
+
+### Windows
+
+**Portable-версия:**
+1. Скачайте ZIP-архив из релиза: `chromium-gost-updater-1.0.0-windows.zip`
+2. Распакуйте архив в любую директорию
+3. Запустите `chromium-gost-updater.bat`
+
+**Установщик (рекомендуется):**
+1. Скачайте и запустите `chromium-gost-updater-1.0.0-setup.exe`
+2. Следуйте инструкциям установщика
+3. Приложение будет установлено в `%LOCALAPPDATA%\chromium-gost-updater`
+4. Автоматически создастся задача Task Scheduler для проверки обновлений каждый час
+
+**Важно:** Все зависимости (Python 3.11+ embeddable, Qt/PySide6) включены в portable-версию, дополнительная установка не требуется.
 
 После установки пакета:
 - Скрипты будут в `/usr/bin/`
