@@ -174,7 +174,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: windows-package
-          path: chromium-gost-updater-*-windows.zip
+          path: dist-windows/chromium-gost-updater-*-windows.zip
           retention-days: 30
           if-no-files-found: warn
 
