@@ -1072,29 +1072,25 @@ class QtBackend(GuiBackend):
     def show_update_dialog(self, updater_app: UpdaterApp) -> None:
         """Показать диалог обновления через Qt."""
         log_debug(f"show_update_dialog: called")
-        if not self.app:
-            log_debug(f"show_update_dialog: app not initialized, calling directly")
-        else:
-            # Проверяем, вызывается ли из главного потока Qt
-            QThread = self._get_qthread()
-            is_main_thread = QThread.currentThread() == self.app.thread()
+        # Проверяем, вызывается ли из главного потока Qt
+        QThread = self._get_qthread()
+        is_main_thread = QThread.currentThread() == self.app.thread()
 
-            log_debug(f"show_update_dialog: is_main_thread={is_main_thread}")
-            if is_main_thread:
-                # Вызываем напрямую, так как мы в главном потоке
-                log_debug(
-                    f"show_update_dialog: calling _show_update_dialog_impl directly from main thread"
-                )
-            else:
-                # Вызываем из главного потока через сигнал Qt
-                log_debug(
-                    f"show_update_dialog: scheduling dialog in main thread via Qt signal"
-                )
-                # Используем сигнал для вызова в главном потоке
-                self.__dialog_signaler.show_dialog_signal.emit()
-                log_debug(f"show_update_dialog: emitted show_dialog_signal")
-                return
-        self.__show_update_dialog_impl(updater_app)
+        log_debug(f"show_update_dialog: is_main_thread={is_main_thread}")
+        if is_main_thread:
+            # Вызываем напрямую, так как мы в главном потоке
+            log_debug(
+                f"show_update_dialog: calling _show_update_dialog_impl directly from main thread"
+            )
+            self.__show_update_dialog_impl(updater_app)
+        else:
+            # Вызываем из главного потока через сигнал Qt
+            log_debug(
+                f"show_update_dialog: scheduling dialog in main thread via Qt signal"
+            )
+            # Используем сигнал для вызова в главном потоке
+            self.__dialog_signaler.show_dialog_signal.emit()
+            log_debug(f"show_update_dialog: emitted show_dialog_signal")
 
     def __show_update_dialog_impl(self, updater_app: UpdaterApp) -> None:
         """Внутренняя реализация показа диалога обновления через Qt."""
