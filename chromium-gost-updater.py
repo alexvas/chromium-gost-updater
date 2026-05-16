@@ -3,26 +3,23 @@
 chromium-gost-updater.py
 
 Python tray updater for Chromium Gost (single-file).
-Поддерживает KDE (через PySide6/PyQt5), GNOME и Ubuntu Unity (через AppIndicator).
+Поддерживает KDE (через PySide6/PyQt5), GNOME и Ubuntu Unity (через AppIndicator), Windows (PySide6).
 
 Функции:
- - проверка локальной версии (apt-cache show / rpm -q chromium-gost-stable)
- - проверка удалённой версии (https://update.cryptopro.ru/get/chromium-gost/version)
- - сравнение (учёт "-<debrev>" у локальной версии)
- - показывать tray-иконку и диалог Обновить / Игнорировать / Напомнить позже
-   - KDE: через PySide6 / PyQt5 (QSystemTrayIcon)
-   - GNOME/Unity: через AppIndicator3 (python3-gi)
-     Примечание: для GNOME требуется расширение AppIndicator Support или TopIcons Plus
- - скачивание .deb/.rpm с повторными попытками
- - установка через pkexec (dpkg -i для deb, rpm -Uvh для rpm)
- - хранение состояния (ignored versions, remind timestamps) в ~/.cache/chromium_gost_updater/state.json
- - конфиг в ~/.chromium-gost-updater.toml
+ - проверка локальной и удалённой версии
+ - автоматическое скачивание дистрибутива при наличии обновления
+ - Linux: проверка .deb/.rpm через утилиту file; диалог с командой sudo apt/dnf install
+ - Windows: проверка PE-инсталлера; открытие проводника в папке кэша
+ - tray-иконка; при ошибке скачивания — иконка ошибки в трее
+ - хранение состояния (ignored versions, remind timestamps)
+ - конфиг в /etc/chromium-gost-updater.toml или ~/.chromium-gost-updater.toml
 
 Ограничения/заметки внутри кода.
 """
 
 import sys
 import os
+import re
 import subprocess
 import shlex
 import time
@@ -32,9 +29,14 @@ import atexit
 import random
 import webbrowser
 from datetime import datetime
+from email.message import Message
 from urllib.request import urlopen, Request
 from pathlib import Path
 from itertools import chain
+
+IS_WINDOWS = sys.platform == "win32"
+MIN_ARTIFACT_SIZE = 100 * 1024
+DOWNLOAD_RETRY_BASE_DELAY_SEC = 2.0
 
 
 # Detect Desktop Environment
@@ -102,13 +104,27 @@ DESKTOP_ENV = detect_desktop_environment()
 APPNAME = "Chromium Gost Updater"
 PACKAGE_NAME = "chromium-gost-stable"
 HOME = Path.home()
-CACHE_DIR = HOME / ".cache" / "chromium_gost_updater"
+
+if IS_WINDOWS:
+    _local_app_data = os.environ.get("LOCALAPPDATA")
+    CACHE_DIR = (
+        Path(_local_app_data) / "chromium_gost_updater"
+        if _local_app_data
+        else HOME / "AppData" / "Local" / "chromium_gost_updater"
+    )
+    LOG_FILE = Path(os.environ.get("TEMP", ".")) / "chromium-gost-updater.log"
+else:
+    CACHE_DIR = HOME / ".cache" / "chromium_gost_updater"
+    LOG_FILE = Path("/tmp/chromium-gost-updater.log")
+
 CACHE_PACKAGES_DIR = CACHE_DIR / "packages"
 CACHE_MANIFEST_FILE = CACHE_PACKAGES_DIR / "cache.toml"
 STATE_FILE = CACHE_DIR / "state.json"
 LOCK_FILE = CACHE_DIR / "gui_instance.lock"
-LOG_FILE = Path("/tmp/chromium-gost-updater.log")
 
+REMOTE_BASE_URL = "https://update.cryptopro.ru/get/chromium-gost"
+REMOTE_VERSION_CHECK_URL = f"{REMOTE_BASE_URL}/version"
+WINDOWS_INSTALLER_URL = f"{REMOTE_BASE_URL}/windows/386/installer"
 
 # Генерируем случайный положительный long идентификатор сессии
 SESSION_ID = random.randint(1, 2**63 - 1)
@@ -123,6 +139,118 @@ def log_debug(message: str) -> None:
             f.write(log_entry)
     except Exception:
         pass  # Игнорируем ошибки записи в лог
+
+
+def _path_for_display(path: Path) -> str:
+    """Путь с ~ вместо домашней директории для показа пользователю."""
+    try:
+        resolved = path.expanduser().resolve()
+        home = HOME.resolve()
+        text = str(resolved)
+        if text.startswith(str(home)):
+            return "~" + text[len(str(home)) :]
+        return text
+    except Exception:
+        return str(path)
+
+
+def _is_html_response(content_type: str | None, data: bytes) -> bool:
+    if content_type and "text/html" in content_type.lower():
+        return True
+    start = data[:128].lstrip().lower()
+    return start.startswith(b"<") or start.startswith(b"<!doctype")
+
+
+def _filename_from_content_disposition(header_value: str | None) -> str | None:
+    if not header_value:
+        return None
+    msg = Message()
+    msg["content-disposition"] = header_value
+    filename = msg.get_filename()
+    if filename:
+        return os.path.basename(filename)
+    match = re.search(r'filename\*?=(?:UTF-8\'\')?"?([^";\n]+)"?', header_value, re.I)
+    if match:
+        return os.path.basename(match.group(1).strip())
+    return None
+
+
+def validate_pe_artifact(path: Path) -> bool:
+    """Проверка Windows-инсталлера: размер, MZ и базовый заголовок PE.
+
+    Подлинность (Authenticode, хеш с сервера) не проверяется.
+    """
+    try:
+        size = path.stat().st_size
+        if size < MIN_ARTIFACT_SIZE:
+            log_debug(f"validate_pe: file too small ({size} bytes)")
+            return False
+        with path.open("rb") as f:
+            header = f.read(0x40)
+        if len(header) < 0x40 or header[:2] != b"MZ":
+            log_debug("validate_pe: missing MZ signature")
+            return False
+        e_lfanew = int.from_bytes(header[0x3C:0x40], "little")
+        if e_lfanew <= 0 or e_lfanew > size - 4:
+            log_debug(f"validate_pe: invalid e_lfanew={e_lfanew}")
+            return False
+        with path.open("rb") as f:
+            f.seek(e_lfanew)
+            pe_sig = f.read(4)
+        if pe_sig != b"PE\x00\x00":
+            log_debug("validate_pe: missing PE signature")
+            return False
+        return True
+    except Exception as e:
+        log_debug(f"validate_pe: exception: {e}")
+        return False
+
+
+def validate_linux_package_file(path: Path, extension: str) -> bool:
+    """Проверка .deb/.rpm через утилиту file."""
+    try:
+        proc = subprocess.run(
+            ["file", str(path)],
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+        if proc.returncode != 0:
+            log_debug(f"validate_linux: file command failed: {proc.stderr[:200]}")
+            return False
+        output = proc.stdout.lower()
+        if extension == "deb":
+            ok = "debian binary package" in output
+        elif extension == "rpm":
+            ok = "rpm" in output
+        else:
+            ok = False
+        if not ok:
+            log_debug(f"validate_linux: unexpected file output: {proc.stdout[:200]}")
+        return ok
+    except Exception as e:
+        log_debug(f"validate_linux: exception: {e}")
+        return False
+
+
+def validate_artifact(path: Path, extension: str) -> bool:
+    if IS_WINDOWS:
+        return validate_pe_artifact(path)
+    return validate_linux_package_file(path, extension)
+
+
+def open_installer_folder(package_path: Path) -> None:
+    """Открыть проводник Windows с выделенным инсталлером."""
+    if not IS_WINDOWS:
+        return
+    try:
+        subprocess.run(
+            ["explorer", "/select,", os.path.normpath(str(package_path.resolve()))],
+            check=False,
+        )
+        log_debug(f"open_installer_folder: opened {package_path}")
+    except Exception as e:
+        log_debug(f"open_installer_folder: failed: {e}")
 
 
 # Дата-класс версий: локальная и удалённая версии
@@ -145,10 +273,10 @@ class PackageVersions:
 
     def differ(self) -> bool:
         if not self.__remote:
-            log_debug(f"differ: remote is empty, returning False")
+            log_debug("differ: remote is empty, returning False")
             return False
         if not self.__local:
-            log_debug(f"differ: local is empty, returning True")
+            log_debug("differ: local is empty, returning True")
             return True
         result = self.__local != self.__remote
         log_debug(
@@ -310,12 +438,12 @@ def save_state(state: dict) -> None:
 
 class PackageManager:
     """
-    Базовый класс для установки пакета дистрибутива браузера (дебки или рпмки)
-    и проверки версии установленного пакета.
+    Базовый класс для проверки версии установленного пакета
+    и формирования команды ручной установки (Linux).
     """
 
-    def _create_install_command(self, package_path: str) -> list[str]:
-        """Сформировать команду установки пакета."""
+    def format_user_install_command(self, package_path: Path) -> str:
+        """Команда для ручной установки скачанного дистрибутива."""
         raise NotImplementedError
 
     @classmethod
@@ -340,107 +468,6 @@ class PackageManager:
             return parts[0]
         return input
 
-    def install(
-        self, package_path: str, gui_env_vars: dict[str, str] | None = None
-    ) -> tuple[bool, str]:
-        """
-        Используем pkexec, чтобы запустить сформированную команду установки.
-        pkexec работает в KDE, GNOME и Unity, но для показа GUI диалога требуется
-        запущенный агент аутентификации Polkit (polkit-kde-authentication-agent-1
-        для KDE, polkit-gnome-authentication-agent-1 для GNOME/Unity).
-
-        Args:
-            package_path: путь к пакету для установки
-            gui_env_vars: словарь с переменными окружения GUI (DISPLAY, XAUTHORITY, DBUS_SESSION_BUS_ADDRESS),
-                         захваченными в главном потоке. Если None, пытается получить из окружения или systemctl.
-
-        Returns (success: bool, combined_output: str)
-        """
-        # Передаем DISPLAY и XAUTHORITY через окружение процесса, а не через команду
-        # Это позволяет pkexec показать GUI диалог, но команда в диалоге будет чистой
-        env = os.environ.copy()
-
-        # Используем переданные переменные окружения GUI (захваченные в главном потоке)
-        # или пытаемся получить их из текущего окружения/systemctl
-        if gui_env_vars:
-            display = gui_env_vars.get("DISPLAY")
-            xauthority = gui_env_vars.get("XAUTHORITY")
-            dbus_session = gui_env_vars.get("DBUS_SESSION_BUS_ADDRESS")
-            log_debug(f"install: using GUI env vars from main thread")
-        else:
-            display = env.get("DISPLAY")
-            xauthority = env.get("XAUTHORITY")
-            dbus_session = env.get("DBUS_SESSION_BUS_ADDRESS")
-
-        # Если переменные не найдены, пытаемся получить их через systemctl
-        if not display or not xauthority:
-            try:
-                result = subprocess.run(
-                    ["systemctl", "--user", "show-environment"],
-                    capture_output=True,
-                    text=True,
-                    timeout=2,
-                )
-                if result.returncode == 0:
-                    for line in result.stdout.splitlines():
-                        if line.startswith("DISPLAY=") and not display:
-                            display = line.split("=", 1)[1]
-                            log_debug(f"install: got DISPLAY from systemctl: {display}")
-                        elif line.startswith("XAUTHORITY=") and not xauthority:
-                            xauthority = line.split("=", 1)[1]
-                            log_debug(
-                                f"install: got XAUTHORITY from systemctl: {xauthority}"
-                            )
-                        elif (
-                            line.startswith("DBUS_SESSION_BUS_ADDRESS=")
-                            and not dbus_session
-                        ):
-                            dbus_session = line.split("=", 1)[1]
-                            log_debug(
-                                f"install: got DBUS_SESSION_BUS_ADDRESS from systemctl"
-                            )
-            except Exception as e:
-                log_debug(f"install: failed to get env vars from systemctl: {e}")
-
-        # Устанавливаем переменные в окружение для pkexec
-        if display:
-            env["DISPLAY"] = display
-        if xauthority:
-            env["XAUTHORITY"] = xauthority
-        if dbus_session:
-            env["DBUS_SESSION_BUS_ADDRESS"] = dbus_session
-
-        # Логируем переменные окружения для отладки
-        log_debug(
-            f"install: DISPLAY={display}, XAUTHORITY={xauthority}, DBUS_SESSION_BUS_ADDRESS={'set' if dbus_session else 'not set'}"
-        )
-
-        # Объединяем обе команды в один вызов pkexec через sh -c
-        # Команда в диалоге будет: sh -c "dpkg -i ... && apt -f install -y"
-        # Используем shlex.quote для безопасного экранирования пути
-        cmd = ["pkexec"] + self._create_install_command(package_path)
-        log_debug(f"install: executing pkexec command: {' '.join(cmd)}")
-        try:
-            proc = subprocess.run(
-                cmd,
-                check=False,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-                env=env,
-            )
-            output = proc.stdout + "\n" + proc.stderr
-            success = proc.returncode == 0
-            log_debug(
-                f"install: pkexec returned code {proc.returncode}, success={success}"
-            )
-            if not success:
-                log_debug(f"install: pkexec output: {output[:500]}")
-            return success, output
-        except Exception as e:
-            log_debug(f"install: exception during pkexec execution: {e}")
-            return False, str(e)
-
     @classmethod
     def _check_output_for_package(cls, cmd_prefix: list[str]) -> str | None:
         """
@@ -464,6 +491,8 @@ class PackageManager:
         """
         Метод-фабрика для создания реализации менеджера пакетов.
         """
+        if IS_WINDOWS:
+            return WindowsPackageManager()
 
         def __check_quietly(cmd: list[str]) -> bool:
             try:
@@ -504,10 +533,9 @@ class DebPackageManager(PackageManager):
     Работает с дистрибутивами, основанными на Deb-пакетах
     """
 
-    def _create_install_command(self, package_path: str) -> list[str]:
-        quoted_path = shlex.quote(package_path)
-        cmd = f"dpkg -i {quoted_path} && apt -f install -y"
-        return ["sh", "-c", cmd]
+    def format_user_install_command(self, package_path: Path) -> str:
+        abs_path = str(package_path.expanduser().resolve())
+        return f"sudo apt install {shlex.quote(abs_path)}"
 
     @classmethod
     def get_local_version(cls) -> str | None:
@@ -537,8 +565,9 @@ class RpmPackageManager(PackageManager):
     Работает с дистрибутивами, основанными на пакетах RPM
     """
 
-    def _create_install_command(self, package_path: str) -> list[str]:
-        return ["rpm", "-Uvh", package_path]
+    def format_user_install_command(self, package_path: Path) -> str:
+        abs_path = str(package_path.expanduser().resolve())
+        return f"sudo dnf install {shlex.quote(abs_path)}"
 
     @classmethod
     def get_local_version(cls) -> str | None:
@@ -574,6 +603,85 @@ class RpmPackageManager(PackageManager):
         return "rpm"
 
 
+class WindowsPackageManager(PackageManager):
+    """Версия браузера из реестра Windows, скачивание .exe инсталлера."""
+
+    _BEACON_PATHS = (
+        r"Software\ChromiumGost\BLBeacon",
+        r"Software\Chromium Gost\BLBeacon",
+    )
+
+    def format_user_install_command(self, package_path: Path) -> str:
+        return _path_for_display(package_path)
+
+    @classmethod
+    def get_local_version(cls) -> str | None:
+        import winreg
+
+        for hive, subkey in (
+            (winreg.HKEY_CURRENT_USER, path) for path in cls._BEACON_PATHS
+        ):
+            try:
+                with winreg.OpenKey(hive, subkey) as key:
+                    version, _ = winreg.QueryValueEx(key, "version")
+                    if version:
+                        normalized = cls._normalize_local_version(str(version))
+                        log_debug(
+                            f"WindowsPackageManager: version from BLBeacon: {normalized}"
+                        )
+                        return normalized
+            except OSError:
+                continue
+
+        uninstall_roots = (
+            (winreg.HKEY_LOCAL_MACHINE, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+            (
+                winreg.HKEY_LOCAL_MACHINE,
+                r"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+            ),
+            (winreg.HKEY_CURRENT_USER, r"SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"),
+        )
+        for hive, root in uninstall_roots:
+            try:
+                with winreg.OpenKey(hive, root) as uninstall_key:
+                    for i in range(winreg.QueryInfoKey(uninstall_key)[0]):
+                        try:
+                            sub_name = winreg.EnumKey(uninstall_key, i)
+                            with winreg.OpenKey(uninstall_key, sub_name) as subkey:
+                                display_name = cls._read_reg_str(subkey, "DisplayName")
+                                if not display_name or "chromium" not in display_name.lower():
+                                    continue
+                                if "gost" not in display_name.lower():
+                                    continue
+                                display_version = cls._read_reg_str(subkey, "DisplayVersion")
+                                if display_version:
+                                    normalized = cls._normalize_local_version(
+                                        display_version
+                                    )
+                                    log_debug(
+                                        f"WindowsPackageManager: version from Uninstall: {normalized}"
+                                    )
+                                    return normalized
+                        except OSError:
+                            continue
+            except OSError:
+                continue
+        return None
+
+    @staticmethod
+    def _read_reg_str(key, name: str) -> str | None:
+        import winreg
+
+        try:
+            value, _ = winreg.QueryValueEx(key, name)
+            return str(value) if value is not None else None
+        except OSError:
+            return None
+
+    def get_extension(self) -> str:
+        return "exe"
+
+
 PACKAGE_MANAGER: PackageManager = PackageManager.create()
 
 # -------------------------
@@ -587,8 +695,6 @@ PACKAGE_MANAGER: PackageManager = PackageManager.create()
 
 class Downloader:
 
-    VERSION_CHECK_URL = "https://update.cryptopro.ru/get/chromium-gost/version"
-    PACKAGE_DOWNLOAD_URL_TEMPLATE = "https://update.cryptopro.ru/chromium-gost/chromium-gost-{{version}}-linux-amd64.{{extension}}"
     HEADERS = {"User-Agent": "chromium-gost-updater/1.0"}
 
     def _get_cache_dir(self) -> Path:
@@ -639,7 +745,7 @@ class Downloader:
 
         # Try tomllib (py3.11), else toml (pip)
         try:
-            import tomllib as toml_loader  # Python 3.11+
+            import tomllib as toml_loader  # Python 3.11+  # noqa: F401
 
             # tomllib не имеет метода dump, используем toml
             import toml as toml_dumper  # type: ignore[import]
@@ -657,10 +763,71 @@ class Downloader:
         except Exception as e:
             log_debug(f"cache: failed to save manifest: {e}")
 
+    def _resolve_cached_file(
+        self, version: str, package_info: dict, extension: str
+    ) -> Path | None:
+        filename = package_info.get("file")
+        if not filename:
+            log_debug(f"cache: no filename in package info for version {version}")
+            return None
+
+        cache_dir = self._get_cache_dir()
+        cached_file = cache_dir / filename
+
+        if not cached_file.exists():
+            log_debug(f"cache: file {filename} not found in cache directory")
+            return None
+
+        expected_size = package_info.get("size")
+        if expected_size:
+            actual_size = cached_file.stat().st_size
+            if actual_size != expected_size:
+                log_debug(
+                    f"cache: size mismatch for {filename}: expected {expected_size}, got {actual_size}"
+                )
+                return None
+
+        status = package_info.get("status")
+        if status == "error":
+            if self.get_failed_attempts(version) >= self.get_retries_count():
+                log_debug(
+                    f"cache: version {version} marked as error, download attempts exhausted"
+                )
+            else:
+                log_debug(f"cache: version {version} marked as error in manifest")
+            return None
+
+        if status != "ok":
+            if validate_artifact(cached_file, extension):
+                self._register_in_cache(
+                    version, filename, cached_file, "ok", failed_attempts=0
+                )
+                return cached_file
+            failed_attempts = min(
+                self.get_failed_attempts(version) + 1, self.get_retries_count()
+            )
+            self._register_in_cache(
+                version, filename, cached_file, "error", failed_attempts=failed_attempts
+            )
+            return None
+
+        if not validate_artifact(cached_file, extension):
+            log_debug(f"cache: cached file {filename} failed validation")
+            failed_attempts = min(
+                self.get_failed_attempts(version) + 1, self.get_retries_count()
+            )
+            self._register_in_cache(
+                version, filename, cached_file, "error", failed_attempts=failed_attempts
+            )
+            return None
+
+        log_debug(f"cache: found valid cached file {filename} for version {version}")
+        return cached_file
+
     def _check_cache(self, version: str, extension: str) -> Path | None:
         """
         Проверить наличие файла в кэше.
-        Возвращает путь к файлу, если он есть и валиден, иначе None.
+        Возвращает путь к файлу, если он есть и валиден (status=ok), иначе None.
         """
         manifest = self._load_cache_manifest()
         packages = manifest.get("packages", {})
@@ -674,30 +841,12 @@ class Downloader:
             log_debug(f"cache: invalid package info for version {version}")
             return None
 
-        filename = package_info.get("file")
-        if not filename:
-            log_debug(f"cache: no filename in package info for version {version}")
-            return None
+        return self._resolve_cached_file(version, package_info, extension)
 
-        cache_dir = self._get_cache_dir()
-        cached_file = cache_dir / filename
-
-        if not cached_file.exists():
-            log_debug(f"cache: file {filename} not found in cache directory")
-            return None
-
-        # Проверяем размер файла
-        expected_size = package_info.get("size")
-        if expected_size:
-            actual_size = cached_file.stat().st_size
-            if actual_size != expected_size:
-                log_debug(
-                    f"cache: size mismatch for {filename}: expected {expected_size}, got {actual_size}"
-                )
-                return None
-
-        log_debug(f"cache: found valid cached file {filename} for version {version}")
-        return cached_file
+    def get_valid_cached_package(self, version: str) -> Path | None:
+        """Публичная обёртка для получения валидного файла из кэша."""
+        ext = PACKAGE_MANAGER.get_extension()
+        return self._check_cache(version, ext)
 
     def cleanup_old_cache_files(self, max_age_days: int | None = None) -> None:
         """
@@ -770,7 +919,7 @@ class Downloader:
         """
         version_check_timeout = 15
         try:
-            req = Request(self.VERSION_CHECK_URL, headers=self.HEADERS)
+            req = Request(REMOTE_VERSION_CHECK_URL, headers=self.HEADERS)
             with urlopen(req, timeout=version_check_timeout) as r:
                 text = r.read().decode("utf-8").strip()
                 return text
@@ -780,74 +929,177 @@ class Downloader:
     def get_retries_count(self) -> int:
         return CONFIG.download_retries()
 
-    def download_package(self, version: str) -> Path | None:
+    def _get_manifest_entry(self, version: str) -> dict | None:
+        manifest = self._load_cache_manifest()
+        package_info = manifest.get("packages", {}).get(version)
+        if isinstance(package_info, dict):
+            return package_info
+        return None
+
+    def get_failed_attempts(self, version: str) -> int:
+        entry = self._get_manifest_entry(version)
+        if not entry:
+            return 0
+        try:
+            return int(entry.get("failed_attempts", 0))
+        except (TypeError, ValueError):
+            return 0
+
+    def has_exhausted_download_attempts(self, version: str) -> bool:
+        return self.get_failed_attempts(version) >= self.get_retries_count()
+
+    def _reset_failed_attempts(self, version: str) -> None:
+        manifest = self._load_cache_manifest()
+        packages = manifest.get("packages", {})
+        if version in packages and isinstance(packages[version], dict):
+            packages[version]["failed_attempts"] = 0
+            manifest["packages"] = packages
+            self._save_cache_manifest(manifest)
+
+    def _get_download_target(self, version: str, ext: str) -> tuple[str, str]:
+        if IS_WINDOWS:
+            filename = f"chromium-gost-{version}-installer.exe"
+            return WINDOWS_INSTALLER_URL, filename
+        filename = f"chromium-gost-{version}-linux-amd64.{ext}"
+        url = f"{REMOTE_BASE_URL}/linux/amd64/{filename}"
+        return url, filename
+
+    def download_package(self, version: str, force: bool = False) -> Path | None:
         """
-        Загружаем пакет (.deb or .rpm) с повторами.
-        Сначала проверяем кэш, если файл есть и валиден - используем его.
-        Возвращаем путь к загруженному файлу или None, если не удалось.
+        Загружаем дистрибутив с повторами.
+        Сначала проверяем кэш, если файл есть и валиден (status=ok) — используем его.
+        Невалидный артефакт (не deb/rpm/PE): не более get_retries_count() попыток суммарно,
+        с удвоением паузы между попытками. После исчерпания лимита сервер не дёргаем.
         """
         ext = PACKAGE_MANAGER.get_extension()
+        max_attempts = self.get_retries_count()
 
-        # Проверяем кэш перед скачиванием
         cached_file = self._check_cache(version, ext)
         if cached_file:
             log_debug(f"cache: using cached file for version {version}")
             return cached_file
 
-        # Если файла нет в кэше, скачиваем в кэш-директорию
+        prior_failures = self.get_failed_attempts(version)
+        if not force and prior_failures >= max_attempts:
+            log_debug(
+                f"cache: download skipped for {version}, "
+                f"failed_attempts={prior_failures} >= {max_attempts}"
+            )
+            return None
+
+        if force:
+            self._reset_failed_attempts(version)
+            prior_failures = 0
+
         cache_dir = self._get_cache_dir()
-        url = self.PACKAGE_DOWNLOAD_URL_TEMPLATE.replace(
-            "{{version}}", version
-        ).replace("{{extension}}", ext)
-        filename = url.split("/")[-1]
+        url, filename = self._get_download_target(version, ext)
         dest = cache_dir / filename
 
-        log_debug(f"cache: downloading {version} to cache directory")
-        attempt = 0
-        retries = self.get_retries_count()
-        while attempt < retries:
+        log_debug(f"cache: downloading {version} from {url}")
+        attempt = prior_failures
+        delay_sec = DOWNLOAD_RETRY_BASE_DELAY_SEC
+
+        while attempt < max_attempts:
             attempt += 1
             try:
                 downloaded_file = self.__do_download_package(url, dest)
-                if downloaded_file:
-                    # Регистрируем файл в манифесте кэша
-                    self._register_in_cache(version, filename, downloaded_file)
-                    return downloaded_file
+                if not downloaded_file:
+                    log_debug(
+                        f"cache: download attempt {attempt}/{max_attempts} "
+                        f"returned no file for {version}"
+                    )
+                    self._register_in_cache(
+                        version, filename, dest, "error", failed_attempts=attempt
+                    )
+                else:
+                    filename = downloaded_file.name
+                    if validate_artifact(downloaded_file, ext):
+                        self._register_in_cache(
+                            version, filename, downloaded_file, "ok", failed_attempts=0
+                        )
+                        return downloaded_file
+                    log_debug(
+                        f"cache: validation failed for {filename} "
+                        f"(attempt {attempt}/{max_attempts})"
+                    )
+                    self._register_in_cache(
+                        version, filename, downloaded_file, "error", failed_attempts=attempt
+                    )
+                    self.__unlink(downloaded_file)
             except Exception as e:
-                log_debug(f"cache: download attempt {attempt} failed: {e}")
-                time.sleep(2 ** min(attempt, 5))
+                log_debug(
+                    f"cache: download attempt {attempt}/{max_attempts} failed: {e}"
+                )
+                self._register_in_cache(
+                    version, filename, dest, "error", failed_attempts=attempt
+                )
+
+            if attempt < max_attempts:
+                log_debug(f"cache: waiting {delay_sec:.0f}s before next download attempt")
+                time.sleep(delay_sec)
+                delay_sec *= 2
+
         return None
 
-    def _register_in_cache(self, version: str, filename: str, file_path: Path) -> None:
+    def _register_in_cache(
+        self,
+        version: str,
+        filename: str,
+        file_path: Path,
+        status: str,
+        failed_attempts: int | None = None,
+    ) -> None:
         """Зарегистрировать скачанный файл в манифесте кэша."""
         manifest = self._load_cache_manifest()
         packages = manifest.setdefault("packages", {})
 
-        file_size = file_path.stat().st_size
+        file_size = file_path.stat().st_size if file_path.exists() else 0
         downloaded_at = datetime.now().isoformat()
 
-        packages[version] = {
+        entry: dict = {
             "file": filename,
             "downloaded_at": downloaded_at,
             "size": file_size,
+            "status": status,
         }
+        if failed_attempts is not None:
+            entry["failed_attempts"] = failed_attempts
+
+        packages[version] = entry
 
         manifest["packages"] = packages
         self._save_cache_manifest(manifest)
         log_debug(
-            f"cache: registered version {version} in manifest (file: {filename}, size: {file_size})"
+            f"cache: registered version {version} status={status} "
+            f"failed_attempts={failed_attempts} (file: {filename}, size: {file_size})"
         )
 
     def __do_download_package(self, url: str, dest: Path) -> Path | None:
         req = Request(url, headers=self.HEADERS)
-        with urlopen(req, timeout=30) as r, open(dest, "wb") as f:
-            f.write(r.read())
-        # basic sanity check
-        if dest.exists() and dest.stat().st_size > 1024:
-            return dest
-        else:
-            self.__unlink(dest)
+        timeout = 120 if IS_WINDOWS else 60
+        with urlopen(req, timeout=timeout) as r:
+            content_type = r.headers.get("Content-Type")
+            content_disposition = r.headers.get("Content-Disposition")
+            # Допустимо читать целиком: размер артефактов ограничен и проверяется ниже.
+            data = r.read()
+
+        if _is_html_response(content_type, data):
+            log_debug("cache: download returned HTML instead of package")
             return None
+
+        if IS_WINDOWS:
+            cd_name = _filename_from_content_disposition(content_disposition)
+            if cd_name:
+                dest = dest.parent / cd_name
+
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        with dest.open("wb") as f:
+            f.write(data)
+
+        if dest.exists() and dest.stat().st_size >= MIN_ARTIFACT_SIZE:
+            return dest
+        self.__unlink(dest)
+        return None
 
     def __unlink(self, dest: Path) -> None:
         try:
@@ -1088,11 +1340,6 @@ class UpdaterApp:
         """Установить напоминание позже для версии."""
         pass
 
-    def do_update(self) -> None:
-        """Выполнить обновление."""
-        pass
-
-
 # -------------------------
 # API UpdaterApp: конец
 # -------------------------
@@ -1107,12 +1354,10 @@ class GuiBackend:
     """Базовый класс для GUI бэкендов."""
 
     # Константы для диалога обновления
-    DIALOG_TITLE = "Обновить Chromium Gost"
-    UPDATE_BTN_TEXT = "Давай, обновляй!"
+    DIALOG_TITLE = "Обновление Chromium Gost"
     CHANGELOG_BTN_TEXT = "А чё там поменялось?"
     IGNORE_BTN_TEXT = "Игнорировать версию"
     REMIND_BTN_TEXT = "Напомнить позже"
-
     def __init__(self):
         self.app = None
         self.tray = None
@@ -1148,11 +1393,25 @@ class GuiBackend:
         )
         if share_icon.exists():
             return share_icon
+
+        if IS_WINDOWS:
+            win_share = (
+                Path(os.environ.get("LOCALAPPDATA", ""))
+                / "chromium-gost-updater"
+                / "chromium-gost-logo.png"
+            )
+            if win_share.exists():
+                return win_share
         return None
 
-    def _build_dialog_message(self, package_versions: PackageVersions) -> str:
+    def _build_dialog_message(self, updater_app: "UpdaterAppImpl") -> str:
         """Построить сообщение для диалога обновления."""
-        return f"Обновить Chromium Gost\nс версии\n{package_versions.local() or 'не установлено'}\nна версию\n{package_versions.remote()}\n?"
+        remote = updater_app.current_package_versions.remote() or "?"
+        package_path = updater_app.get_ready_package()
+        if package_path:
+            install_command = PACKAGE_MANAGER.format_user_install_command(package_path)
+            return f"Имеется новая версия.\n\nУстановить:\n\n{install_command}"
+        return f"Имеется новая версия {remote}.\n\nДистрибутив ещё не скачан."
 
     def _build_ignore_notification(self, remote: str) -> str:
         """Построить сообщение об игнорировании версии."""
@@ -1178,6 +1437,10 @@ class GuiBackend:
         """Показать tray, если он скрыт."""
         raise NotImplementedError
 
+    def set_tray_error_state(self, error: bool) -> None:
+        """Показать иконку ошибки в трее или восстановить обычную."""
+        pass
+
     def quit(self) -> None:
         """Выход из приложения."""
         raise NotImplementedError
@@ -1189,6 +1452,22 @@ class GuiBackend:
     @classmethod
     def create(cls) -> "GuiBackend":
         """Создать подходящий GUI бэкенд на основе доступных библиотек."""
+        if IS_WINDOWS:
+            try:
+                from PySide6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox  # type: ignore[import]  # noqa: F401
+                from PySide6.QtGui import QIcon  # type: ignore[import]  # noqa: F401
+
+                return Pyside6GuiBackend()
+            except Exception:
+                try:
+                    from PyQt5.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QAction, QMessageBox  # noqa: F401
+                    from PyQt5.QtGui import QIcon  # noqa: F401
+
+                    return Pyqt5GuiBackend()
+                except Exception:
+                    pass
+            return NoneGuiBackend()
+
         # Try AppIndicator for Unity and GNOME (preferred for these DEs)
         if DESKTOP_ENV in ("unity", "gnome"):
             try:
@@ -1196,7 +1475,7 @@ class GuiBackend:
 
                 gi.require_version("AppIndicator3", "0.1")
                 gi.require_version("Gtk", "3.0")
-                from gi.repository import AppIndicator3, Gtk, GLib
+                from gi.repository import AppIndicator3, Gtk, GLib  # noqa: F401
 
                 backend = AppIndicatorGuiBackend()
                 return backend
@@ -1215,13 +1494,13 @@ class GuiBackend:
             try:
                 # Тестируем успешность импортов. Импорты ниже нужны
                 from PyQt5.QtWidgets import (
-                    QApplication,
-                    QSystemTrayIcon,
-                    QMenu,
-                    QAction,
-                    QMessageBox,
+                    QApplication,  # noqa: F401
+                    QSystemTrayIcon,  # noqa: F401
+                    QMenu,  # noqa: F401
+                    QAction,  # noqa: F401
+                    QMessageBox,  # noqa: F401
                 )  # pyright: ignore[reportUnusedImport]
-                from PyQt5.QtGui import QIcon  # pyright: ignore[reportUnusedImport]
+                from PyQt5.QtGui import QIcon  # pyright: ignore[reportUnusedImport]  # noqa: F401
 
                 backend = Pyqt5GuiBackend()
                 return backend
@@ -1295,6 +1574,7 @@ class QtBackend(GuiBackend):
     def __init__(self):
         """Инициализация Qt бэкенда (создание DialogSignaler)."""
         super().__init__()
+        self._normal_tray_icon = None
         QObject = self._get_qobject()
         Signal = self._get_signal()
 
@@ -1331,6 +1611,7 @@ class QtBackend(GuiBackend):
             icon = QIcon(str(icon_path))
         else:
             icon = QIcon.fromTheme("chromium")
+        self._normal_tray_icon = icon
         tray.setIcon(icon)
         tray.setToolTip(APPNAME)
         menu = QMenu()
@@ -1364,11 +1645,11 @@ class QtBackend(GuiBackend):
         self.__dialog_signaler.show_dialog_signal.connect(
             lambda: self.__show_update_dialog_impl(updater_app)
         )
-        log_debug(f"create_tray: created dialog signaler in main thread")
+        log_debug("create_tray: created dialog signaler in main thread")
 
     def show_update_dialog(self, updater_app: UpdaterApp) -> None:
         """Показать диалог обновления через Qt."""
-        log_debug(f"show_update_dialog: called")
+        log_debug("show_update_dialog: called")
         # Проверяем, вызывается ли из главного потока Qt
         QThread = self._get_qthread()
         is_main_thread = QThread.currentThread() == self.app.thread()
@@ -1377,74 +1658,73 @@ class QtBackend(GuiBackend):
         if is_main_thread:
             # Вызываем напрямую, так как мы в главном потоке (клик по иконке tray)
             log_debug(
-                f"show_update_dialog: calling _show_update_dialog_impl directly from main thread"
+                "show_update_dialog: calling _show_update_dialog_impl directly from main thread"
             )
             self.__show_update_dialog_impl(updater_app)
         else:
             # Вызываем из главного потока через сигнал Qt
             # (попали сюда из меню "Проверить сейчас" или через автопоказ диалога для AppIndicator)
             log_debug(
-                f"show_update_dialog: scheduling dialog in main thread via Qt signal"
+                "show_update_dialog: scheduling dialog in main thread via Qt signal"
             )
             # Используем сигнал для вызова в главном потоке
             self.__dialog_signaler.show_dialog_signal.emit()
-            log_debug(f"show_update_dialog: emitted show_dialog_signal")
+            log_debug("show_update_dialog: emitted show_dialog_signal")
 
     def __show_update_dialog_impl(self, updater_app: UpdaterApp) -> None:
         """Внутренняя реализация показа диалога обновления через Qt."""
-        log_debug(f"_show_update_dialog_impl: called")
-        message = self._build_dialog_message(updater_app.current_package_versions)
+        log_debug("_show_update_dialog_impl: called")
+        message = self._build_dialog_message(updater_app)
         remote = updater_app.current_package_versions.remote()
         ignore_notification = self._build_ignore_notification(remote)
         remind_message = self._build_remind_message(remote)
 
-        # Получаем классы через геттеры бэкенда
         QMessageBox = self._get_qmessagebox()
         Qt = self._get_qt()
 
         msg = QMessageBox()
         msg.setWindowTitle(self.DIALOG_TITLE)
         msg.setText(message)
-        msg.setModal(True)  # Устанавливаем модальность
-        # Устанавливаем флаги окна для правильного отображения
+        msg.setModal(True)
         msg.setWindowFlags(msg.windowFlags() | Qt.WindowStaysOnTopHint)
-        update_btn = msg.addButton(self.UPDATE_BTN_TEXT, QMessageBox.AcceptRole)
-        # добавляем кнопку, которая открывает страничку с changelog
         changelog_btn = msg.addButton(self.CHANGELOG_BTN_TEXT, QMessageBox.AcceptRole)
         ignore_btn = msg.addButton(self.IGNORE_BTN_TEXT, QMessageBox.DestructiveRole)
-        remind_btn = msg.addButton(self.REMIND_BTN_TEXT, QMessageBox.RejectRole)
-        msg.setIcon(QMessageBox.Question)
-        # Активируем окно и поднимаем его поверх всех
+        msg.addButton(self.REMIND_BTN_TEXT, QMessageBox.RejectRole)
+        msg.setIcon(QMessageBox.Information)
         msg.activateWindow()
         msg.raise_()
-        # Блокирующий вызов - ждет ответа пользователя
-        # exec_() должен быть вызван из главного потока Qt
-        log_debug(f"_show_update_dialog_impl: showing Qt dialog")
+        log_debug("_show_update_dialog_impl: showing Qt dialog")
         result = msg.exec_()
         clicked = msg.clickedButton()
         log_debug(
             f"_show_update_dialog_impl: Qt dialog result={result}, clicked={clicked}"
         )
-        if clicked == update_btn:
-            log_debug(f"_show_update_dialog_impl: user clicked Update")
-            # Обновляем переменные окружения GUI перед запуском потока
-            if hasattr(updater_app, "_capture_gui_env_vars"):
-                updater_app._gui_env_vars = updater_app._capture_gui_env_vars()
-            threading.Thread(target=updater_app.do_update, daemon=True).start()
-        elif clicked == ignore_btn:
-            log_debug(f"_show_update_dialog_impl: user clicked Ignore")
+        if clicked == ignore_btn:
+            log_debug("_show_update_dialog_impl: user clicked Ignore")
             updater_app.mark_ignored()
             self.show_tray_message(ignore_notification)
         elif clicked == changelog_btn:
-            log_debug(f"_show_update_dialog_impl: user clicked Changelog")
+            log_debug("_show_update_dialog_impl: user clicked Changelog")
             updater_app.show_forum()
         else:
             log_debug(
-                f"_show_update_dialog_impl: user clicked Remind Later or closed dialog"
+                "_show_update_dialog_impl: user clicked Remind Later or closed dialog"
             )
-            # Напомнить позже или закрытие диалога
             updater_app.set_remind_later()
             self.show_tray_message(remind_message)
+
+    def set_tray_error_state(self, error: bool) -> None:
+        if not self.tray:
+            return
+        QIcon = self._get_qicon()
+        if error:
+            icon = QIcon.fromTheme("dialog-error")
+            if icon.isNull():
+                icon = QIcon.fromTheme("emblem-important")
+            if not icon.isNull():
+                self.tray.setIcon(icon)
+        elif self._normal_tray_icon is not None:
+            self.tray.setIcon(self._normal_tray_icon)
 
     def show_tray_message(self, message: str, timeout: int = 3000) -> None:
         """Show tray message via Qt."""
@@ -1623,6 +1903,7 @@ class AppIndicatorGuiBackend(GuiBackend):
 
     def __init__(self):
         super().__init__()
+        self._normal_tray_icon_name = "applications-internet"
         self.__notify_initted = False
         # Инициализируем libnotify для показа уведомлений
         try:
@@ -1643,7 +1924,7 @@ class AppIndicatorGuiBackend(GuiBackend):
 
         gi.require_version("AppIndicator3", "0.1")
         gi.require_version("Gtk", "3.0")
-        from gi.repository import AppIndicator3, Gtk, GLib
+        from gi.repository import AppIndicator3, Gtk
 
         # Initialize GTK
         Gtk.init(sys.argv)
@@ -1656,8 +1937,8 @@ class AppIndicatorGuiBackend(GuiBackend):
         if icon_path:
             icon = str(icon_path)
         else:
-            # Use theme icon as fallback
             icon = "applications-internet"
+        self._normal_tray_icon_name = icon
 
         indicator_id = "chromium-gost-updater"
         self.tray = AppIndicator3.Indicator.new(
@@ -1690,15 +1971,14 @@ class AppIndicatorGuiBackend(GuiBackend):
 
     def show_update_dialog(self, updater_app: UpdaterApp) -> None:
         """Внутренняя реализация показа диалога обновления через AppIndicator (GTK)."""
-        log_debug(f"show_update_dialog: called")
-        message = self._build_dialog_message(updater_app.current_package_versions)
+        log_debug("show_update_dialog: called")
+        message = self._build_dialog_message(updater_app)
         remote = updater_app.current_package_versions.remote()
         if not remote:
             return
         ignore_notification = self._build_ignore_notification(remote)
         remind_message = self._build_remind_message(remote)
 
-        # For AppIndicator, use GTK dialog
         import gi
 
         gi.require_version("Gtk", "3.0")
@@ -1707,38 +1987,38 @@ class AppIndicatorGuiBackend(GuiBackend):
         dialog = Gtk.MessageDialog(
             parent=None,
             flags=Gtk.DialogFlags.MODAL,
-            type=Gtk.MessageType.QUESTION,
+            type=Gtk.MessageType.INFO,
             buttons=Gtk.ButtonsType.NONE,
             message_format=message,
         )
         dialog.set_title(self.DIALOG_TITLE)
 
-        dialog.add_button(self.UPDATE_BTN_TEXT, Gtk.ResponseType.ACCEPT)
         dialog.add_button(self.CHANGELOG_BTN_TEXT, Gtk.ResponseType.HELP)
         dialog.add_button(self.IGNORE_BTN_TEXT, Gtk.ResponseType.REJECT)
+        dialog.add_button(self.REMIND_BTN_TEXT, Gtk.ResponseType.CLOSE)
 
-        log_debug(f"show_update_dialog: showing GTK dialog for AppIndicator")
+        log_debug("show_update_dialog: showing GTK dialog for AppIndicator")
         response = dialog.run()
         dialog.destroy()
         log_debug(f"show_update_dialog: GTK dialog response={response}")
 
-        if response == Gtk.ResponseType.ACCEPT:
-            log_debug(f"show_update_dialog: user clicked Update")
-            # Обновляем переменные окружения GUI перед запуском потока
-            if hasattr(updater_app, "_capture_gui_env_vars"):
-                updater_app._gui_env_vars = updater_app._capture_gui_env_vars()
-            threading.Thread(target=updater_app.do_update, daemon=True).start()
-        elif response == Gtk.ResponseType.HELP:
-            log_debug(f"show_update_dialog: user clicked Changelog")
+        if response == Gtk.ResponseType.HELP:
+            log_debug("show_update_dialog: user clicked Changelog")
             updater_app.show_forum()
         elif response == Gtk.ResponseType.REJECT:
-            log_debug(f"show_update_dialog: user clicked Ignore")
+            log_debug("show_update_dialog: user clicked Ignore")
             updater_app.mark_ignored()
             self.show_tray_message(ignore_notification)
         else:
-            log_debug(f"show_update_dialog: user clicked Remind Later or closed dialog")
+            log_debug("show_update_dialog: user clicked Remind Later or closed dialog")
             updater_app.set_remind_later()
             self.show_tray_message(remind_message)
+
+    def set_tray_error_state(self, error: bool) -> None:
+        if not self.tray:
+            return
+        icon = "dialog-error" if error else self._normal_tray_icon_name
+        self.tray.set_icon(icon)
 
     def show_tray_message(self, message: str, timeout: int = 3000) -> None:
         """Show tray message via libnotify for AppIndicator."""
@@ -1860,45 +2140,87 @@ class UpdaterAppImpl(UpdaterApp):
         self.state.setdefault("ignored_versions", [])
         self.state.setdefault("remind_at", {})
         self.current_package_versions = PackageVersions()
-        # Сохраняем переменные окружения GUI при инициализации (в главном потоке)
-        self._gui_env_vars = self._capture_gui_env_vars()
+        self._download_lock = threading.Lock()
+        self._download_in_progress = False
 
-    def _capture_gui_env_vars(self) -> dict[str, str]:
-        """Захватить переменные окружения GUI из текущего контекста."""
-        env_vars = {}
-        for key in ["DISPLAY", "XAUTHORITY", "DBUS_SESSION_BUS_ADDRESS"]:
-            value = os.environ.get(key)
-            if value:
-                env_vars[key] = value
-                log_debug(f"_capture_gui_env_vars: captured {key}={value}")
-        return env_vars
+    def get_ready_package(self, version: str | None = None) -> Path | None:
+        version = version or self.current_package_versions.remote()
+        if not version:
+            return None
+        return DOWNLOADER.get_valid_cached_package(version)
 
-    def _get_gui_env_vars(self) -> dict[str, str]:
-        """Получить сохраненные переменные окружения GUI или попытаться получить их заново."""
-        if self._gui_env_vars:
-            return self._gui_env_vars.copy()
+    def has_ready_package(self, version: str | None = None) -> bool:
+        return self.get_ready_package(version) is not None
 
-        # Если переменные не были захвачены, пытаемся получить их через systemctl
-        env_vars = {}
-        try:
-            result = subprocess.run(
-                ["systemctl", "--user", "show-environment"],
-                capture_output=True,
-                text=True,
-                timeout=2,
-            )
-            if result.returncode == 0:
-                for line in result.stdout.splitlines():
-                    if line.startswith("DISPLAY="):
-                        env_vars["DISPLAY"] = line.split("=", 1)[1]
-                    elif line.startswith("XAUTHORITY="):
-                        env_vars["XAUTHORITY"] = line.split("=", 1)[1]
-                    elif line.startswith("DBUS_SESSION_BUS_ADDRESS="):
-                        env_vars["DBUS_SESSION_BUS_ADDRESS"] = line.split("=", 1)[1]
-        except Exception as e:
-            log_debug(f"_get_gui_env_vars: failed to get from systemctl: {e}")
+    def _set_tray_error(self, error: bool) -> None:
+        GUI_BACKEND.set_tray_error_state(error)
 
-        return env_vars
+    def notify_update_ready(
+        self,
+        *,
+        user_initiated: bool = False,
+        package_path: Path | None = None,
+        remote_version: str | None = None,
+    ) -> None:
+        if package_path is None:
+            package_path = self.get_ready_package(remote_version)
+        if not package_path:
+            return
+        self._set_tray_error(False)
+        remote = remote_version or self.current_package_versions.remote() or "?"
+        if user_initiated:
+            if IS_WINDOWS:
+                open_installer_folder(package_path)
+            else:
+                self.show_update_dialog()
+            return
+        artifact = "инсталлер" if IS_WINDOWS else "дистрибутив"
+        GUI_BACKEND.show_tray_message(
+            f"Скачан {artifact} Chromium Gost {remote}", 5000
+        )
+
+    def download_update_async(self, force: bool = False) -> None:
+        remote = self.current_package_versions.remote()
+        if not remote:
+            return
+
+        with self._download_lock:
+            if self._download_in_progress:
+                GUI_BACKEND.show_tray_message("Скачивание уже выполняется...", 3000)
+                return
+            if not force and self.has_ready_package(remote):
+                self.notify_update_ready(remote_version=remote)
+                return
+            self._download_in_progress = True
+
+        def worker() -> None:
+            try:
+                GUI_BACKEND.show_tray_message(f"Скачивание {remote}...", 3000)
+                package_path = DOWNLOADER.download_package(remote, force=force)
+                if package_path:
+                    self.notify_update_ready(
+                        package_path=package_path,
+                        remote_version=remote,
+                    )
+                else:
+                    self._set_tray_error(True)
+                    retries = DOWNLOADER.get_retries_count()
+                    if DOWNLOADER.has_exhausted_download_attempts(remote):
+                        GUI_BACKEND.show_tray_message(
+                            f"Дистрибутив {remote} не прошёл проверку после "
+                            f"{retries} попыток. Повторная загрузка отложена.",
+                            8000,
+                        )
+                    else:
+                        GUI_BACKEND.show_tray_message(
+                            f"Не удалось скачать {remote}",
+                            5000,
+                        )
+            finally:
+                with self._download_lock:
+                    self._download_in_progress = False
+
+        threading.Thread(target=worker, daemon=True).start()
 
     def check_package_versions(self) -> PackageVersions:
         local = PACKAGE_MANAGER.get_local_version()
@@ -1929,7 +2251,7 @@ class UpdaterAppImpl(UpdaterApp):
         current_time = time.time()
         log_debug(f"has_updates: remind_at={remind_at}, current_time={current_time}")
         if remind_at and current_time < float(remind_at):
-            log_debug(f"has_updates: remind_at not expired, returning False")
+            log_debug("has_updates: remind_at not expired, returning False")
             return False
         differ = self.current_package_versions.differ()
         log_debug(f"has_updates: versions={self.current_package_versions}")
@@ -1993,7 +2315,7 @@ class UpdaterAppImpl(UpdaterApp):
             self.state["ignored_versions"] = ignored_versions
             self.state["remind_at"] = remind_at
             save_state(self.state)
-            log_debug(f"cleanup_installed_version: state saved after cleanup")
+            log_debug("cleanup_installed_version: state saved after cleanup")
 
     def create_tray(self) -> None:
         """Создать tray иконку через GUI бэкенд."""
@@ -2002,64 +2324,22 @@ class UpdaterAppImpl(UpdaterApp):
     def handle_left_or_double_click(self) -> None:
         """Обработчик левого или двойного клика на tray иконке."""
         if self.has_updates():
-            self.show_update_dialog()
+            if self.has_ready_package():
+                self.notify_update_ready(user_initiated=True)
+            else:
+                self.download_update_async()
         else:
             GUI_BACKEND.show_tray_message("Обновлений не найдено")
 
     def show_update_dialog(self) -> None:
         """Показать диалог обновления через GUI бэкенд."""
-        log_debug(f"show_update_dialog: called")
+        if IS_WINDOWS:
+            return
+        log_debug("show_update_dialog: called")
         GUI_BACKEND.show_update_dialog(self)
-
-    def do_update(self) -> None:
-        remote_version = self.current_package_versions.remote()
-        if not remote_version:
-            GUI_BACKEND.show_tray_message("Не удалось определить версию для обновления")
-            return
-        GUI_BACKEND.show_tray_message(f"Скачивание {remote_version}...")
-        package_path = DOWNLOADER.download_package(remote_version)
-        if not package_path:
-            retries = DOWNLOADER.get_retries_count()
-            GUI_BACKEND.show_tray_message(
-                f"Не удалось скачать {remote_version} после {retries} попыток", 5000
-            )
-            return
-        GUI_BACKEND.show_tray_message("Файл скачан, запрашиваю права администратора...")
-        attempts = CONFIG.auth_password_attempts()
-        # Получаем переменные окружения GUI для передачи в install()
-        gui_env_vars = self._get_gui_env_vars()
-        log_debug(
-            f"do_update: passing GUI env vars to install: {list(gui_env_vars.keys())}"
-        )
-        for attempt in range(1, attempts + 1):
-            # Determine package type by extension or package manager
-            ok, out = PACKAGE_MANAGER.install(package_path, gui_env_vars=gui_env_vars)
-            if ok:
-                GUI_BACKEND.show_tray_message(f"Установлено {remote_version}", 5000)
-                # Cleanup old package files after successful installation
-                cleanup_old_package_files(keep_current=package_path)
-                time.sleep(1.0)
-                self.check_package_versions()
-                # Очищаем только что установленную версию из ignored_versions и remind_at
-                self.cleanup_installed_version()
-                save_state(self.state)
-                return
-            else:
-                if attempt < attempts:
-                    GUI_BACKEND.show_tray_message(
-                        f"Ошибка установки (попытка {attempt}/{attempts}). Попробуйте снова.",
-                        4000,
-                    )
-                    time.sleep(1.5)
-                else:
-                    GUI_BACKEND.show_tray_message(
-                        f"Установка не удалась: {out[:200]}", 8000
-                    )
-                    return
 
     def manual_check_and_notify(self) -> None:
         log_debug("manual_check_and_notify: starting manual check")
-        # Показываем tray при ручной проверке, если он скрыт
         GUI_BACKEND.show_tray_if_hidden()
         package_versions = self.check_package_versions()
         log_debug(f"manual_check_and_notify: package_versions={package_versions}")
@@ -2071,34 +2351,20 @@ class UpdaterAppImpl(UpdaterApp):
             log_debug("manual_check_and_notify: remote check failed")
             GUI_BACKEND.show_tray_message("Не удалось получить удалённую версию")
             return
-        # При ручной проверке игнорируем remind_at и ignored_versions не проверяем отдельно,
-        # так как пользователь явно запросил проверку
-        ignored_versions = self.state.get("ignored_versions", [])
-        log_debug(f"manual_check_and_notify: ignored_versions={ignored_versions}")
+
         differ = self.current_package_versions.differ()
-        if remote in ignored_versions:
-            # Версия в игнорируемых, но при ручной проверке все равно показываем диалог
-            # Пользователь может передумать
-            log_debug(f"manual_check_and_notify: {remote} is in ignored_versions")
-            if differ:
-                log_debug(
-                    f"manual_check_and_notify: versions differ, showing dialog (ignored version)"
-                )
-                self.show_update_dialog()
-            else:
-                log_debug(
-                    "manual_check_and_notify: versions same, showing no updates message"
-                )
-                GUI_BACKEND.show_tray_message("Обновлений не найдено")
-        elif differ:
-            # Версии различаются - показываем диалог независимо от remind_at
-            log_debug(f"manual_check_and_notify: versions differ, showing dialog")
-            self.show_update_dialog()
-        else:
-            log_debug(
-                "manual_check_and_notify: versions same, showing no updates message"
-            )
+        if not differ:
+            log_debug("manual_check_and_notify: no updates")
             GUI_BACKEND.show_tray_message("Обновлений не найдено")
+            return
+
+        if self.has_ready_package(remote):
+            log_debug("manual_check_and_notify: ready package in cache")
+            self.notify_update_ready(user_initiated=True)
+            return
+
+        log_debug("manual_check_and_notify: starting download")
+        self.download_update_async(force=True)
 
 
 def main() -> None:
@@ -2119,7 +2385,9 @@ def main() -> None:
 
     # Check if running under systemd (no DISPLAY) or check-only mode requested
     # For systemd timers, run in headless mode even if GUI is available
-    has_display = os.environ.get("DISPLAY") and os.environ.get("DISPLAY") != ""
+    has_display = IS_WINDOWS or (
+        os.environ.get("DISPLAY") and os.environ.get("DISPLAY") != ""
+    )
     check_only = "--check-only" in sys.argv or not has_display
     show_tray_lazily = "--show-tray-lazily" in sys.argv
 
@@ -2160,14 +2428,8 @@ def main() -> None:
 
         atexit.register(cleanup_lock)
 
-        # For AppIndicator (Unity), show dialog automatically if update is available
-        if isinstance(GUI_BACKEND, AppIndicatorGuiBackend) and has_updates:
-            # Show dialog after a short delay to ensure tray is ready
-            def show_dialog_delayed() -> None:
-                time.sleep(0.5)
-                updater.show_update_dialog()
-
-            threading.Thread(target=show_dialog_delayed, daemon=True).start()
+        if has_updates:
+            updater.download_update_async()
 
         # Run appropriate main loop
         sys.exit(GUI_BACKEND.run_main_loop())
@@ -2177,12 +2439,26 @@ def main() -> None:
         if updater.has_updates():
             remote = updater.current_package_versions.remote()
             print("UPDATE AVAILABLE:", remote)
-            # Try to launch GUI version, then send notification
             gui_launched = launch_gui_version()
             if gui_launched:
                 msg = f"Доступно обновление {remote}\nGUI запущен в системном трее."
             else:
-                msg = f"Доступно обновление {remote}\nЗапустите скрипт вручную для установки."
+                package_path = DOWNLOADER.download_package(remote) if remote else None
+                if package_path:
+                    install_hint = PACKAGE_MANAGER.format_user_install_command(
+                        package_path
+                    )
+                    if IS_WINDOWS:
+                        install_hint = _path_for_display(package_path)
+                    msg = (
+                        f"Доступно обновление {remote}\n"
+                        f"Скачан дистрибутив:\n{install_hint}"
+                    )
+                else:
+                    msg = (
+                        f"Доступно обновление {remote}\n"
+                        "Запустите скрипт вручную для скачивания."
+                    )
             NOTIFIER.notify(msg, 10000)
         else:
             print("No update available.")
