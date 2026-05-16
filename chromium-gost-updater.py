@@ -964,6 +964,11 @@ class Downloader:
         url = f"{REMOTE_BASE_URL}/linux/amd64/{filename}"
         return url, filename
 
+    def get_package_filename(self, version: str) -> str:
+        ext = PACKAGE_MANAGER.get_extension()
+        _, filename = self._get_download_target(version, ext)
+        return filename
+
     def download_package(self, version: str, force: bool = False) -> Path | None:
         """
         Загружаем дистрибутив с повторами.
@@ -1324,6 +1329,10 @@ class UpdaterApp:
         """Обработчик левого или двойного клика на tray иконке."""
         pass
 
+    def show_install(self) -> None:
+        """Показать команду установки или открыть папку с дистрибутивом."""
+        pass
+
     def manual_check_and_notify(self) -> None:
         """Ручная проверка обновлений и уведомление."""
         pass
@@ -1355,6 +1364,7 @@ class GuiBackend:
 
     # Константы для диалога обновления
     DIALOG_TITLE = "Обновление Chromium Gost"
+    INSTALL_DIALOG_TITLE = "Установка Chromium Gost"
     CHANGELOG_BTN_TEXT = "А чё там поменялось?"
     IGNORE_BTN_TEXT = "Игнорировать версию"
     REMIND_BTN_TEXT = "Напомнить позже"
@@ -1413,6 +1423,14 @@ class GuiBackend:
             return f"Имеется новая версия.\n\nУстановить:\n\n{install_command}"
         return f"Имеется новая версия {remote}.\n\nДистрибутив ещё не скачан."
 
+    def _build_install_dialog_message(self, updater_app: "UpdaterAppImpl") -> str:
+        """Построить сообщение для диалога установки."""
+        package_path = updater_app.get_ready_package()
+        if not package_path:
+            return "Дистрибутив не скачан.\n\nСначала выполните «Проверить сейчас»."
+        install_command = PACKAGE_MANAGER.format_user_install_command(package_path)
+        return f"Установить:\n\n{install_command}"
+
     def _build_ignore_notification(self, remote: str) -> str:
         """Построить сообщение об игнорировании версии."""
         return f"Версия {remote} будет игнорироваться"
@@ -1428,6 +1446,14 @@ class GuiBackend:
     def show_update_dialog(self, updater_app: UpdaterApp) -> None:
         """Показать диалог обновления."""
         raise NotImplementedError
+
+    def show_install_dialog(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог с командой установки."""
+        raise NotImplementedError
+
+    def update_install_menu_visibility(self, updater_app: UpdaterApp) -> None:
+        """Показать пункт «Установить», только если в кэше есть валидный дистрибутив."""
+        pass
 
     def show_tray_message(self, message: str, timeout: int = 3000) -> None:
         """Показать сообщение в трее."""
@@ -1582,6 +1608,8 @@ class QtBackend(GuiBackend):
             """Вспомогательный QObject для сигналов Qt, позволяющий вызывать методы из других потоков."""
 
             show_dialog_signal = Signal()
+            show_install_dialog_signal = Signal()
+            refresh_install_menu_signal = Signal()
 
         self.__dialog_signaler_class = DialogSignaler
 
@@ -1612,14 +1640,18 @@ class QtBackend(GuiBackend):
         else:
             icon = QIcon.fromTheme("chromium")
         self._normal_tray_icon = icon
+        self._install_menu_action = None
         tray.setIcon(icon)
         tray.setToolTip(APPNAME)
         menu = QMenu()
         check_action = QAction("Проверить сейчас", menu)
         forum_action = QAction("Чё там на форуме?", menu)
+        install_action = QAction("Установить", menu)
+        self._install_menu_action = install_action
         quit_action = QAction("Выйти", menu)
         menu.addAction(check_action)
         menu.addAction(forum_action)
+        menu.addAction(install_action)
         menu.addAction(quit_action)
         tray.setContextMenu(menu)
         check_action.triggered.connect(
@@ -1630,6 +1662,11 @@ class QtBackend(GuiBackend):
         forum_action.triggered.connect(
             lambda checked=False: threading.Thread(
                 target=updater_app.show_forum, daemon=True
+            ).start()
+        )
+        install_action.triggered.connect(
+            lambda checked=False: threading.Thread(
+                target=updater_app.show_install, daemon=True
             ).start()
         )
         quit_action.triggered.connect(lambda checked=False: self.quit())
@@ -1645,7 +1682,29 @@ class QtBackend(GuiBackend):
         self.__dialog_signaler.show_dialog_signal.connect(
             lambda: self.__show_update_dialog_impl(updater_app)
         )
+        self.__dialog_signaler.show_install_dialog_signal.connect(
+            lambda: self.__show_install_dialog_impl(updater_app)
+        )
+        self.__dialog_signaler.refresh_install_menu_signal.connect(
+            lambda: self.__update_install_menu_visibility_impl(updater_app)
+        )
         log_debug("create_tray: created dialog signaler in main thread")
+
+    def update_install_menu_visibility(self, updater_app: UpdaterApp) -> None:
+        """Показать пункт «Установить», только если в кэше есть валидный дистрибутив."""
+        QThread = self._get_qthread()
+        is_main_thread = QThread.currentThread() == self.app.thread()
+        if is_main_thread:
+            self.__update_install_menu_visibility_impl(updater_app)
+        else:
+            self.__dialog_signaler.refresh_install_menu_signal.emit()
+
+    def __update_install_menu_visibility_impl(self, updater_app: UpdaterApp) -> None:
+        if not self._install_menu_action:
+            return
+        visible = updater_app.has_ready_package()
+        self._install_menu_action.setVisible(visible)
+        log_debug(f"update_install_menu_visibility: visible={visible}")
 
     def show_update_dialog(self, updater_app: UpdaterApp) -> None:
         """Показать диалог обновления через Qt."""
@@ -1670,6 +1729,36 @@ class QtBackend(GuiBackend):
             # Используем сигнал для вызова в главном потоке
             self.__dialog_signaler.show_dialog_signal.emit()
             log_debug("show_update_dialog: emitted show_dialog_signal")
+
+    def show_install_dialog(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог установки через Qt."""
+        log_debug("show_install_dialog: called")
+        QThread = self._get_qthread()
+        is_main_thread = QThread.currentThread() == self.app.thread()
+        log_debug(f"show_install_dialog: is_main_thread={is_main_thread}")
+        if is_main_thread:
+            self.__show_install_dialog_impl(updater_app)
+        else:
+            self.__dialog_signaler.show_install_dialog_signal.emit()
+            log_debug("show_install_dialog: emitted show_install_dialog_signal")
+
+    def __show_install_dialog_impl(self, updater_app: UpdaterApp) -> None:
+        """Внутренняя реализация диалога установки через Qt."""
+        log_debug("_show_install_dialog_impl: called")
+        message = self._build_install_dialog_message(updater_app)
+        QMessageBox = self._get_qmessagebox()
+        Qt = self._get_qt()
+        msg = QMessageBox()
+        msg.setWindowTitle(self.INSTALL_DIALOG_TITLE)
+        msg.setText(message)
+        msg.setModal(True)
+        msg.setWindowFlags(msg.windowFlags() | Qt.WindowStaysOnTopHint)
+        msg.addButton(QMessageBox.Ok)
+        msg.setIcon(QMessageBox.Information)
+        msg.activateWindow()
+        msg.raise_()
+        log_debug("_show_install_dialog_impl: showing Qt install dialog")
+        msg.exec_()
 
     def __show_update_dialog_impl(self, updater_app: UpdaterApp) -> None:
         """Внутренняя реализация показа диалога обновления через Qt."""
@@ -1904,6 +1993,10 @@ class AppIndicatorGuiBackend(GuiBackend):
     def __init__(self):
         super().__init__()
         self._normal_tray_icon_name = "applications-internet"
+        self._install_menu_item = None
+        self._install_menu_visible: bool | None = None
+        self._tray_error_state: bool | None = None
+        self._gtk_main_thread_id: int | None = None
         self.__notify_initted = False
         # Инициализируем libnotify для показа уведомлений
         try:
@@ -1918,6 +2011,64 @@ class AppIndicatorGuiBackend(GuiBackend):
         except Exception:
             pass
 
+    def _is_gtk_main_thread(self) -> bool:
+        return (
+            self._gtk_main_thread_id is not None
+            and threading.get_ident() == self._gtk_main_thread_id
+        )
+
+    def _get_glib(self):
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import GLib
+
+        return GLib
+
+    def _run_on_gtk_main_async(self, fn, *args, **kwargs) -> None:
+        """Выполнить UI-код в GTK main loop (без ожидания результата)."""
+        if self._is_gtk_main_thread():
+            log_debug(f"_run_on_gtk_main_async: direct call on main thread ({fn.__name__})")
+            fn(*args, **kwargs)
+            return
+        log_debug(f"_run_on_gtk_main_async: scheduling on main thread ({fn.__name__})")
+        GLib = self._get_glib()
+
+        def _wrapped() -> bool:
+            try:
+                fn(*args, **kwargs)
+            except Exception as e:
+                log_debug(f"_run_on_gtk_main_async: error in {fn.__name__}: {e}")
+            return False
+
+        GLib.idle_add(_wrapped, priority=GLib.PRIORITY_DEFAULT)
+
+    def _run_on_gtk_main_sync(self, fn, *args, **kwargs):
+        """Выполнить UI-код в GTK main loop и дождаться результата."""
+        if self._is_gtk_main_thread():
+            log_debug(f"_run_on_gtk_main_sync: direct call on main thread ({fn.__name__})")
+            return fn(*args, **kwargs)
+        log_debug(f"_run_on_gtk_main_sync: scheduling on main thread ({fn.__name__})")
+        GLib = self._get_glib()
+        result: dict[str, object] = {"value": None, "error": None}
+        done = threading.Event()
+
+        def _wrapped() -> bool:
+            try:
+                result["value"] = fn(*args, **kwargs)
+            except Exception as e:
+                result["error"] = e
+                log_debug(f"_run_on_gtk_main_sync: error in {fn.__name__}: {e}")
+            finally:
+                done.set()
+            return False
+
+        GLib.idle_add(_wrapped, priority=GLib.PRIORITY_DEFAULT)
+        done.wait()
+        if result["error"] is not None:
+            raise result["error"]
+        return result["value"]
+
     def create_tray(self, updater_app: UpdaterApp) -> None:
         """Create tray icon using AppIndicator for Unity/GNOME."""
         import gi
@@ -1928,6 +2079,7 @@ class AppIndicatorGuiBackend(GuiBackend):
 
         # Initialize GTK
         Gtk.init(sys.argv)
+        self._gtk_main_thread_id = threading.get_ident()
         self.app = Gtk.Application.new("com.chromium.gost.updater", 0)
 
         # Find icon path
@@ -1960,6 +2112,25 @@ class AppIndicatorGuiBackend(GuiBackend):
         )
         menu.append(check_item)
 
+        forum_item = Gtk.MenuItem(label="Чё там на форуме?")
+        forum_item.connect(
+            "activate",
+            lambda ignored_widget: threading.Thread(
+                target=updater_app.show_forum, daemon=True
+            ).start(),
+        )
+        menu.append(forum_item)
+
+        install_item = Gtk.MenuItem(label="Установить")
+        self._install_menu_item = install_item
+        install_item.connect(
+            "activate",
+            lambda ignored_widget: threading.Thread(
+                target=updater_app.show_install, daemon=True
+            ).start(),
+        )
+        menu.append(install_item)
+
         menu.append(Gtk.SeparatorMenuItem())
 
         quit_item = Gtk.MenuItem(label="Выйти")
@@ -1969,9 +2140,24 @@ class AppIndicatorGuiBackend(GuiBackend):
         menu.show_all()
         self.tray.set_menu(menu)
 
-    def show_update_dialog(self, updater_app: UpdaterApp) -> None:
-        """Внутренняя реализация показа диалога обновления через AppIndicator (GTK)."""
-        log_debug("show_update_dialog: called")
+    def __update_install_menu_visibility_impl(self, visible: bool) -> None:
+        if not self._install_menu_item:
+            return
+        if self._install_menu_visible == visible:
+            return
+        self._install_menu_item.set_visible(visible)
+        self._install_menu_visible = visible
+        log_debug(f"update_install_menu_visibility: visible={visible}")
+
+    def update_install_menu_visibility(self, updater_app: UpdaterApp) -> None:
+        if not self._install_menu_item:
+            return
+        visible = updater_app.has_ready_package()
+        self._run_on_gtk_main_async(self.__update_install_menu_visibility_impl, visible)
+
+    def __show_update_dialog_impl(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог обновления (только из GTK main thread)."""
+        log_debug("__show_update_dialog_impl: called")
         message = self._build_dialog_message(updater_app)
         remote = updater_app.current_package_versions.remote()
         if not remote:
@@ -1997,28 +2183,71 @@ class AppIndicatorGuiBackend(GuiBackend):
         dialog.add_button(self.IGNORE_BTN_TEXT, Gtk.ResponseType.REJECT)
         dialog.add_button(self.REMIND_BTN_TEXT, Gtk.ResponseType.CLOSE)
 
-        log_debug("show_update_dialog: showing GTK dialog for AppIndicator")
+        log_debug("__show_update_dialog_impl: showing GTK dialog for AppIndicator")
         response = dialog.run()
         dialog.destroy()
-        log_debug(f"show_update_dialog: GTK dialog response={response}")
+        log_debug(f"__show_update_dialog_impl: GTK dialog response={response}")
 
         if response == Gtk.ResponseType.HELP:
-            log_debug("show_update_dialog: user clicked Changelog")
+            log_debug("__show_update_dialog_impl: user clicked Changelog")
             updater_app.show_forum()
         elif response == Gtk.ResponseType.REJECT:
-            log_debug("show_update_dialog: user clicked Ignore")
+            log_debug("__show_update_dialog_impl: user clicked Ignore")
             updater_app.mark_ignored()
             self.show_tray_message(ignore_notification)
         else:
-            log_debug("show_update_dialog: user clicked Remind Later or closed dialog")
+            log_debug(
+                "__show_update_dialog_impl: user clicked Remind Later or closed dialog"
+            )
             updater_app.set_remind_later()
             self.show_tray_message(remind_message)
+
+    def show_update_dialog(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог обновления через AppIndicator (GTK)."""
+        log_debug("show_update_dialog: called")
+        self._run_on_gtk_main_sync(self.__show_update_dialog_impl, updater_app)
+
+    def __show_install_dialog_impl(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог установки (только из GTK main thread)."""
+        log_debug("__show_install_dialog_impl: called")
+        message = self._build_install_dialog_message(updater_app)
+
+        import gi
+
+        gi.require_version("Gtk", "3.0")
+        from gi.repository import Gtk
+
+        dialog = Gtk.MessageDialog(
+            parent=None,
+            flags=Gtk.DialogFlags.MODAL,
+            type=Gtk.MessageType.INFO,
+            buttons=Gtk.ButtonsType.OK,
+            message_format=message,
+        )
+        dialog.set_title(self.INSTALL_DIALOG_TITLE)
+        log_debug("__show_install_dialog_impl: showing GTK install dialog for AppIndicator")
+        dialog.run()
+        dialog.destroy()
+
+    def show_install_dialog(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог установки через AppIndicator (GTK)."""
+        log_debug("show_install_dialog: called")
+        self._run_on_gtk_main_sync(self.__show_install_dialog_impl, updater_app)
+
+    def __set_tray_error_state_impl(self, error: bool) -> None:
+        if not self.tray:
+            return
+        if self._tray_error_state == error:
+            return
+        icon = "dialog-error" if error else self._normal_tray_icon_name
+        self.tray.set_icon(icon)
+        self._tray_error_state = error
+        log_debug(f"set_tray_error_state: error={error}")
 
     def set_tray_error_state(self, error: bool) -> None:
         if not self.tray:
             return
-        icon = "dialog-error" if error else self._normal_tray_icon_name
-        self.tray.set_icon(icon)
+        self._run_on_gtk_main_async(self.__set_tray_error_state_impl, error)
 
     def show_tray_message(self, message: str, timeout: int = 3000) -> None:
         """Show tray message via libnotify for AppIndicator."""
@@ -2110,6 +2339,13 @@ class NoneGuiBackend(GuiBackend):
         """Показать диалог не поддерживается в headless режиме."""
         pass
 
+    def show_install_dialog(self, updater_app: UpdaterApp) -> None:
+        """Показать диалог установки не поддерживается в headless режиме."""
+        pass
+
+    def update_install_menu_visibility(self, updater_app: UpdaterApp) -> None:
+        pass
+
     def show_tray_message(self, message: str, timeout: int = 3000) -> None:
         """Show message via notify-send in headless mode."""
         NOTIFIER.notify(message, timeout)
@@ -2167,6 +2403,7 @@ class UpdaterAppImpl(UpdaterApp):
         if not package_path:
             return
         self._set_tray_error(False)
+        self.refresh_install_menu_visibility()
         remote = remote_version or self.current_package_versions.remote() or "?"
         if user_initiated:
             if IS_WINDOWS:
@@ -2195,7 +2432,8 @@ class UpdaterAppImpl(UpdaterApp):
 
         def worker() -> None:
             try:
-                GUI_BACKEND.show_tray_message(f"Скачивание {remote}...", 3000)
+                filename = DOWNLOADER.get_package_filename(remote)
+                GUI_BACKEND.show_tray_message(f"Скачивается {filename}", 3000)
                 package_path = DOWNLOADER.download_package(remote, force=force)
                 if package_path:
                     self.notify_update_ready(
@@ -2204,6 +2442,7 @@ class UpdaterAppImpl(UpdaterApp):
                     )
                 else:
                     self._set_tray_error(True)
+                    self.refresh_install_menu_visibility()
                     retries = DOWNLOADER.get_retries_count()
                     if DOWNLOADER.has_exhausted_download_attempts(remote):
                         GUI_BACKEND.show_tray_message(
@@ -2320,16 +2559,47 @@ class UpdaterAppImpl(UpdaterApp):
     def create_tray(self) -> None:
         """Создать tray иконку через GUI бэкенд."""
         GUI_BACKEND.create_tray(self)
+        self.refresh_install_menu_visibility()
+
+    def refresh_install_menu_visibility(self) -> None:
+        """Обновить видимость пункта «Установить» в меню трея."""
+        GUI_BACKEND.update_install_menu_visibility(self)
+
+    def _get_download_filename(self, version: str | None = None) -> str | None:
+        version = version or self.current_package_versions.remote()
+        if not version:
+            return None
+        return DOWNLOADER.get_package_filename(version)
+
+    def _show_downloading_status_message(self, version: str | None = None) -> None:
+        filename = self._get_download_filename(version)
+        if filename:
+            GUI_BACKEND.show_tray_message(f"Скачивается {filename}", 3000)
 
     def handle_left_or_double_click(self) -> None:
         """Обработчик левого или двойного клика на tray иконке."""
+        GUI_BACKEND.show_tray_if_hidden()
+        if self.has_ready_package():
+            self.show_install()
+            return
+        if self._download_in_progress:
+            self._show_downloading_status_message()
+            return
         if self.has_updates():
-            if self.has_ready_package():
-                self.notify_update_ready(user_initiated=True)
-            else:
-                self.download_update_async()
-        else:
-            GUI_BACKEND.show_tray_message("Обновлений не найдено")
+            self.download_update_async()
+            return
+        GUI_BACKEND.show_tray_message("Обновлений не найдено")
+
+    def show_install(self) -> None:
+        """Показать команду установки или открыть папку с дистрибутивом."""
+        GUI_BACKEND.show_tray_if_hidden()
+        package_path = self.get_ready_package()
+        if not package_path:
+            return
+        if IS_WINDOWS:
+            open_installer_folder(package_path)
+            return
+        GUI_BACKEND.show_install_dialog(self)
 
     def show_update_dialog(self) -> None:
         """Показать диалог обновления через GUI бэкенд."""
