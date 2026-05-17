@@ -33,7 +33,7 @@ check_gui_backend() {
     python3 -c "import gi; gi.require_version('AppIndicator3', '0.1'); from gi.repository import AppIndicator3" 2>/dev/null
 }
 
-# Function to check if toml is available (either built-in tomllib or pip toml)
+# TOML: tomllib (3.11+) достаточен; python3-toml/pip toml — опционально
 check_toml() {
     python3 -c "import tomllib" 2>/dev/null || \
     python3 -c "import toml" 2>/dev/null

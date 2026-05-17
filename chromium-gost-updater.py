@@ -141,6 +141,18 @@ def log_debug(message: str) -> None:
         pass  # Игнорируем ошибки записи в лог
 
 
+def log_warn(message: str) -> None:
+    """Записать предупреждение в лог-файл и stderr."""
+    try:
+        timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+        log_entry = f"[{timestamp}] [{SESSION_ID}] WARN {message}\n"
+        with LOG_FILE.open("a", encoding="utf-8") as f:
+            f.write(log_entry)
+        print(f"WARN: {message}", file=sys.stderr)
+    except Exception:
+        pass
+
+
 def _path_for_display(path: Path) -> str:
     """Путь с ~ вместо домашней директории для показа пользователю."""
     try:
@@ -692,6 +704,59 @@ PACKAGE_MANAGER: PackageManager = PackageManager.create()
 # Загрузчик пакетов: начало
 # -------------------------
 
+_CACHE_PKG_DEB_PATTERN = re.compile(
+    r"^chromium-gost-(.+)-linux-amd64\.(deb|rpm)$", re.IGNORECASE
+)
+_CACHE_PKG_EXE_PATTERN = re.compile(
+    r"^chromium-gost-(.+)-installer\.exe$", re.IGNORECASE
+)
+
+
+def _toml_quote_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
+
+
+def _toml_quote_table_key(key: str) -> str:
+    if re.fullmatch(r"[A-Za-z0-9_-]+", key):
+        return key
+    return _toml_quote_string(key)
+
+
+def _serialize_cache_manifest(manifest: dict) -> str:
+    """Сериализовать манифест кэша в TOML без внешних зависимостей."""
+    packages = manifest.get("packages", {})
+    if not isinstance(packages, dict):
+        packages = {}
+
+    lines: list[str] = []
+    for version, info in sorted(packages.items()):
+        if not isinstance(info, dict):
+            continue
+        table_key = _toml_quote_table_key(str(version))
+        lines.append(f"[packages.{table_key}]")
+        for field in ("file", "downloaded_at", "status"):
+            if field not in info:
+                continue
+            val = info[field]
+            if isinstance(val, str):
+                lines.append(f"{field} = {_toml_quote_string(val)}")
+        if "size" in info:
+            try:
+                lines.append(f"size = {int(info['size'])}")
+            except (TypeError, ValueError):
+                pass
+        if "failed_attempts" in info:
+            try:
+                lines.append(f"failed_attempts = {int(info['failed_attempts'])}")
+            except (TypeError, ValueError):
+                pass
+        lines.append("")
+
+    if not lines:
+        return "[packages]\n"
+    return "\n".join(lines).rstrip() + "\n"
+
 
 class Downloader:
 
@@ -720,7 +785,7 @@ class Downloader:
             try:
                 import toml as toml_loader  # type: ignore[import] -- pip install toml
             except Exception:
-                log_debug("cache: toml loader not available, returning empty manifest")
+                log_warn("cache: toml loader not available, returning empty manifest")
                 return {"packages": {}}
 
         try:
@@ -735,7 +800,7 @@ class Downloader:
                     data = toml_loader.load(f)
             return data if isinstance(data, dict) else {"packages": {}}
         except Exception as e:
-            log_debug(f"cache: failed to load manifest: {e}")
+            log_warn(f"cache: failed to load manifest: {e}")
             return {"packages": {}}
 
     def _save_cache_manifest(self, manifest: dict) -> None:
@@ -743,25 +808,69 @@ class Downloader:
         manifest_path = self._get_cache_manifest_path()
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
 
-        # Try tomllib (py3.11), else toml (pip)
+        saved = False
         try:
-            import tomllib as toml_loader  # Python 3.11+  # noqa: F401
+            import toml as toml_dumper  # type: ignore[import] -- python3-toml / pip
 
-            # tomllib не имеет метода dump, используем toml
-            import toml as toml_dumper  # type: ignore[import]
-        except Exception:
-            try:
-                import toml as toml_dumper  # type: ignore[import] -- pip install toml
-            except Exception:
-                log_debug("cache: toml dumper not available, cannot save manifest")
-                return
-
-        try:
             with manifest_path.open("w", encoding="utf-8") as f:
                 toml_dumper.dump(manifest, f)
-            log_debug(f"cache: manifest saved to {manifest_path}")
+            saved = True
+            log_debug(f"cache: manifest saved to {manifest_path} (toml)")
         except Exception as e:
-            log_debug(f"cache: failed to save manifest: {e}")
+            log_debug(f"cache: toml.dump unavailable or failed ({e}), using builtin serializer")
+
+        if not saved:
+            try:
+                manifest_path.write_text(
+                    _serialize_cache_manifest(manifest), encoding="utf-8"
+                )
+                log_debug(f"cache: manifest saved to {manifest_path} (builtin)")
+            except Exception as e:
+                log_warn(f"cache: failed to save manifest: {e}")
+
+    def _version_from_cached_filename(self, filename: str) -> str | None:
+        if IS_WINDOWS:
+            match = _CACHE_PKG_EXE_PATTERN.match(filename)
+        else:
+            match = _CACHE_PKG_DEB_PATTERN.match(filename)
+        return match.group(1) if match else None
+
+    def rebuild_cache_manifest_if_missing(self) -> None:
+        """Восстановить cache.toml из уже скачанных файлов в каталоге кэша."""
+        manifest_path = self._get_cache_manifest_path()
+        if manifest_path.exists():
+            packages = self._load_cache_manifest().get("packages", {})
+            if isinstance(packages, dict) and packages:
+                return
+
+        cache_dir = self._get_cache_dir()
+        ext = PACKAGE_MANAGER.get_extension()
+        rebuilt = False
+        for path in sorted(cache_dir.iterdir()):
+            if not path.is_file():
+                continue
+            version = self._version_from_cached_filename(path.name)
+            if not version:
+                continue
+            if not validate_artifact(path, ext):
+                log_debug(
+                    f"cache: skip rebuild for {path.name}, validation failed"
+                )
+                continue
+            downloaded_at = datetime.fromtimestamp(path.stat().st_mtime).isoformat()
+            self._register_in_cache(
+                version,
+                path.name,
+                path,
+                "ok",
+                failed_attempts=0,
+                downloaded_at=downloaded_at,
+            )
+            rebuilt = True
+            log_debug(f"cache: rebuilt manifest entry for version {version}")
+
+        if rebuilt:
+            log_debug("cache: manifest rebuilt from files on disk")
 
     def _resolve_cached_file(
         self, version: str, package_info: dict, extension: str
@@ -1053,13 +1162,15 @@ class Downloader:
         file_path: Path,
         status: str,
         failed_attempts: int | None = None,
+        downloaded_at: str | None = None,
     ) -> None:
         """Зарегистрировать скачанный файл в манифесте кэша."""
         manifest = self._load_cache_manifest()
         packages = manifest.setdefault("packages", {})
 
         file_size = file_path.stat().st_size if file_path.exists() else 0
-        downloaded_at = datetime.now().isoformat()
+        if downloaded_at is None:
+            downloaded_at = datetime.now().isoformat()
 
         entry: dict = {
             "file": filename,
@@ -2642,6 +2753,10 @@ def main() -> None:
     log_debug(f"Session ID: {SESSION_ID}, PID: {os.getpid()}, Args: {sys.argv}")
     # Cleanup old package files on startup (including cache cleanup)
     cleanup_old_package_files()
+    try:
+        DOWNLOADER.rebuild_cache_manifest_if_missing()
+    except Exception as e:
+        log_debug(f"main: cache manifest rebuild failed: {e}")
     # Очистка старых файлов из кэша при периодических запусках
     try:
         DOWNLOADER.cleanup_old_cache_files()

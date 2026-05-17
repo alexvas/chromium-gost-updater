@@ -118,7 +118,7 @@ cd windows
 **Зависимости для Windows:**
 - Python 3.11 или новее (используется Python embeddable, встроен в дистрибутив)
 - PySide6 (GUI библиотека, автоматически устанавливается через requirements-windows.txt)
-- tomllib (встроен в Python 3.11+, внешняя библиотека toml не требуется)
+- Python 3.11+ (`tomllib` для чтения конфига и `cache.toml`; запись `cache.toml` — встроенным сериализатором, `python3-toml` опционален)
 
 Все зависимости включаются в portable-версию с Python embeddable.
 
