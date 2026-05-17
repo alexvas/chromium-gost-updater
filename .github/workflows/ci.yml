@@ -269,8 +269,7 @@ jobs:
             **Debian/Ubuntu:**
             ```bash
             wget https://github.com/${{ github.repository }}/releases/download/${{ steps.version.outputs.tag_name }}/chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
-            sudo dpkg -i chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
-            sudo apt-get install -f  # Установить зависимости если нужно
+            sudo apt install ./chromium-gost-updater_${{ steps.version.outputs.version }}_all.deb
             ```
             
             **RPM-based (Fedora/RHEL/CentOS):**
