@@ -37,6 +37,8 @@ from itertools import chain
 IS_WINDOWS = sys.platform == "win32"
 MIN_ARTIFACT_SIZE = 100 * 1024
 DOWNLOAD_RETRY_BASE_DELAY_SEC = 2.0
+GRAPHICAL_SESSION_BOOT_WAIT_SEC = 180
+GRAPHICAL_SESSION_POLL_INTERVAL_SEC = 15
 
 
 # Detect Desktop Environment
@@ -469,16 +471,20 @@ class PackageManager:
     @classmethod
     def _normalize_local_version(cls, input: str | None) -> str | None:
         """
+        Удаляем epoch и package revision/release:
+        "1:142.0.7444.176-1" -> "142.0.7444.176" (deb с epoch)
         Удаляем части package revision/release после первого дефиса, если такие имеются:
         "142.0.7444.176-1" -> "142.0.7444.176" (deb)
         "142.0.7444.176-1.el8" -> "142.0.7444.176" (rpm)
         """
         if not input:
             return input
-        if "-" in input:
-            parts = input.split("-", 1)
-            return parts[0]
-        return input
+        normalized = input.strip()
+        if ":" in normalized:
+            normalized = normalized.split(":", 1)[1]
+        if "-" in normalized:
+            normalized = normalized.split("-", 1)[0]
+        return normalized
 
     @classmethod
     def _check_output_for_package(cls, cmd_prefix: list[str]) -> str | None:
@@ -552,9 +558,23 @@ class DebPackageManager(PackageManager):
     @classmethod
     def get_local_version(cls) -> str | None:
         """
-        Находим версию установленного пакета с помощью apt-cache
+        Находим фактически установленную версию пакета через dpkg-query.
+        Если dpkg-query недоступен или не вернул данные, используем fallback через apt-cache.
         Возвращаем текстовую строку с версией (например, "142.0.7444.176-1") или None.
         """
+        try:
+            out = subprocess.check_output(
+                ["dpkg-query", "-W", "-f=${Version}", PACKAGE_NAME],
+                stderr=subprocess.DEVNULL,
+                text=True,
+            )
+            found = out.strip()
+            if found:
+                normalized = cls._normalize_local_version(found)
+                log_debug(f"DebPackageManager: version from dpkg-query: {normalized}")
+                return normalized
+        except (subprocess.CalledProcessError, FileNotFoundError, OSError):
+            pass
 
         out = cls._check_output_for_package(["apt-cache", "show"])
         if not out:
@@ -564,6 +584,7 @@ class DebPackageManager(PackageManager):
             if line.startswith("Version:"):
                 found = line.split(":", 1)[1].strip()
                 normalized = cls._normalize_local_version(found)
+                log_debug(f"DebPackageManager: version from apt-cache fallback: {normalized}")
                 return normalized
 
         return None
@@ -1266,6 +1287,88 @@ def cleanup_old_package_files(keep_current: str | None = None) -> None:
             pass
 
 
+def session_has_graphical_display() -> bool:
+    """Проверить, заданы ли переменные графической сессии DISPLAY или WAYLAND_DISPLAY."""
+    if IS_WINDOWS:
+        return True
+    display = os.environ.get("DISPLAY", "").strip()
+    wayland = os.environ.get("WAYLAND_DISPLAY", "").strip()
+    return bool(display) or bool(wayland)
+
+
+def _x11_display_socket_exists(display: str) -> bool:
+    try:
+        display_num = display.lstrip(":").split(".")[0]
+        socket = Path(f"/tmp/.X11-unix/X{display_num}")
+        return socket.exists()
+    except Exception:
+        return False
+
+
+def _x11_display_usable() -> bool:
+    display = os.environ.get("DISPLAY", "").strip()
+    if not display:
+        return False
+    for cmd in (["xset", "q"], ["xdpyinfo"]):
+        try:
+            result = subprocess.run(
+                cmd,
+                env=os.environ,
+                capture_output=True,
+                timeout=3,
+            )
+            if result.returncode == 0:
+                return True
+        except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
+            continue
+    return _x11_display_socket_exists(display)
+
+
+def _wayland_display_usable() -> bool:
+    wayland = os.environ.get("WAYLAND_DISPLAY", "").strip()
+    if not wayland:
+        return False
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "").strip()
+    if runtime:
+        return (Path(runtime) / wayland).exists()
+    return True
+
+
+def graphical_session_ready() -> bool:
+    """Проверить, что графическая сессия доступна (не только переменные окружения)."""
+    if IS_WINDOWS:
+        return True
+    if os.environ.get("WAYLAND_DISPLAY", "").strip():
+        return _wayland_display_usable()
+    if os.environ.get("DISPLAY", "").strip():
+        return _x11_display_usable()
+    return False
+
+
+def wait_for_graphical_session(
+    max_wait_sec: int = GRAPHICAL_SESSION_BOOT_WAIT_SEC,
+    poll_interval_sec: int = GRAPHICAL_SESSION_POLL_INTERVAL_SEC,
+) -> bool:
+    """Подождать появления графической сессии (например, после загрузки системы)."""
+    if graphical_session_ready():
+        return True
+    log_debug(
+        f"Graphical session not ready, waiting up to {max_wait_sec}s "
+        f"(poll every {poll_interval_sec}s)"
+    )
+    deadline = time.time() + max_wait_sec
+    while time.time() < deadline:
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            break
+        time.sleep(min(poll_interval_sec, remaining))
+        if graphical_session_ready():
+            log_debug("Graphical session became ready")
+            return True
+    log_debug("Graphical session still not ready after wait")
+    return False
+
+
 def is_gui_running() -> bool:
     """
     Check if GUI instance is already running by checking lock file and process.
@@ -1302,8 +1405,9 @@ def launch_gui_version(script_path: str | None = None) -> bool:
     if is_gui_running():
         return True
 
-    # Try to get DISPLAY and XAUTHORITY from active user session
+    # Try to get DISPLAY/WAYLAND and XAUTHORITY from active user session
     display = None
+    wayland_display = None
     xauthority = None
 
     # Method 1: Check environment of systemd user session
@@ -1318,6 +1422,8 @@ def launch_gui_version(script_path: str | None = None) -> bool:
             for line in result.stdout.splitlines():
                 if line.startswith("DISPLAY="):
                     display = line.split("=", 1)[1]
+                elif line.startswith("WAYLAND_DISPLAY="):
+                    wayland_display = line.split("=", 1)[1]
                 elif line.startswith("XAUTHORITY="):
                     xauthority = line.split("=", 1)[1]
     except Exception:
@@ -1338,11 +1444,13 @@ def launch_gui_version(script_path: str | None = None) -> bool:
             pass
 
     # Method 3: Try systemd-run with user environment
-    if display:
+    if display or wayland_display:
         try:
             env_vars = {}
             if display:
                 env_vars["DISPLAY"] = display
+            if wayland_display:
+                env_vars["WAYLAND_DISPLAY"] = wayland_display
             if xauthority:
                 env_vars["XAUTHORITY"] = xauthority
             if "DBUS_SESSION_BUS_ADDRESS" in os.environ:
@@ -1372,6 +1480,8 @@ def launch_gui_version(script_path: str | None = None) -> bool:
         env = os.environ.copy()
         if display:
             env["DISPLAY"] = display
+        if wayland_display:
+            env["WAYLAND_DISPLAY"] = wayland_display
         if xauthority:
             env["XAUTHORITY"] = xauthority
 
@@ -2768,13 +2878,21 @@ def main() -> None:
     # Очищаем уже установленную версию из ignored_versions и remind_at
     updater.cleanup_installed_version()
 
-    # Check if running under systemd (no DISPLAY) or check-only mode requested
-    # For systemd timers, run in headless mode even if GUI is available
-    has_display = IS_WINDOWS or (
-        os.environ.get("DISPLAY") and os.environ.get("DISPLAY") != ""
-    )
-    check_only = "--check-only" in sys.argv or not has_display
+    # Headless без GUI-сессии; при старте без DISPLAY/WAYLAND ждём появления сессии
+    check_only_requested = "--check-only" in sys.argv
     show_tray_lazily = "--show-tray-lazily" in sys.argv
+
+    if not IS_WINDOWS and not check_only_requested and not graphical_session_ready():
+        log_debug(
+            "main: no usable graphical session (DISPLAY/WAYLAND_DISPLAY), "
+            f"waiting up to {GRAPHICAL_SESSION_BOOT_WAIT_SEC}s"
+        )
+        wait_for_graphical_session()
+
+    has_display = graphical_session_ready()
+    check_only = check_only_requested or not has_display
+    if check_only and not check_only_requested:
+        log_debug("main: running in headless mode (graphical session unavailable)")
 
     # Проверяем, доступен ли GUI бэкенд (не NoneGuiBackend)
     gui_available = not isinstance(GUI_BACKEND, NoneGuiBackend)
