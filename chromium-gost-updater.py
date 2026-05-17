@@ -155,6 +155,26 @@ def log_warn(message: str) -> None:
         pass
 
 
+def detect_launch_source(
+    args: list[str] | None = None, env: dict[str, str] | None = None
+) -> str:
+    """Определить источник запуска приложения для диагностики."""
+    if args is None:
+        args = sys.argv[1:]
+    if env is None:
+        env = dict(os.environ)
+
+    if "-session" in args:
+        return "qt-session-restore"
+    if env.get("INVOCATION_ID"):
+        return "systemd-user-service"
+    if "--check-only" in args:
+        return "check-only"
+    if "--show-tray-lazily" in args:
+        return "lazy-cli"
+    return "direct-cli"
+
+
 def _path_for_display(path: Path) -> str:
     """Путь с ~ вместо домашней директории для показа пользователю."""
     try:
@@ -2777,6 +2797,34 @@ class UpdaterAppImpl(UpdaterApp):
             save_state(self.state)
             log_debug("cleanup_installed_version: state saved after cleanup")
 
+    def cleanup_stale_state_versions(self) -> None:
+        """
+        Удалить устаревшие ключи из remind_at.
+
+        remind_at привязан к конкретной удалённой версии. Как только текущая
+        удалённая версия поменялась, прошлые ключи больше не используются.
+        """
+        remind_at = self.state.get("remind_at", {})
+        if not isinstance(remind_at, dict):
+            return
+
+        remote_version = self.current_package_versions.remote()
+        if not remote_version:
+            return
+        stale_versions = [version for version in remind_at if version != remote_version]
+        if not stale_versions:
+            return
+
+        for version in stale_versions:
+            del remind_at[version]
+            log_debug(
+                f"cleanup_stale_state_versions: removed stale remind_at for {version}"
+            )
+
+        self.state["remind_at"] = remind_at
+        save_state(self.state)
+        log_debug("cleanup_stale_state_versions: state saved after cleanup")
+
     def create_tray(self) -> None:
         """Создать tray иконку через GUI бэкенд."""
         GUI_BACKEND.create_tray(self)
@@ -2861,6 +2909,10 @@ class UpdaterAppImpl(UpdaterApp):
 def main() -> None:
     log_debug(f"=== Starting {APPNAME} ===")
     log_debug(f"Session ID: {SESSION_ID}, PID: {os.getpid()}, Args: {sys.argv}")
+    launch_source = detect_launch_source()
+    log_debug(
+        f"Launch marker: pid={os.getpid()}, ppid={os.getppid()}, source={launch_source}"
+    )
     # Cleanup old package files on startup (including cache cleanup)
     cleanup_old_package_files()
     try:
@@ -2877,10 +2929,17 @@ def main() -> None:
     updater.check_package_versions()
     # Очищаем уже установленную версию из ignored_versions и remind_at
     updater.cleanup_installed_version()
+    # Очищаем устаревшие remind_at для старых remote-версий
+    updater.cleanup_stale_state_versions()
 
     # Headless без GUI-сессии; при старте без DISPLAY/WAYLAND ждём появления сессии
     check_only_requested = "--check-only" in sys.argv
-    show_tray_lazily = "--show-tray-lazily" in sys.argv
+    qt_session_restore = "-session" in sys.argv
+    show_tray_lazily = "--show-tray-lazily" in sys.argv or qt_session_restore
+    if qt_session_restore:
+        log_debug(
+            "main: Qt session restore detected (-session), forcing lazy tray mode"
+        )
 
     if not IS_WINDOWS and not check_only_requested and not graphical_session_ready():
         log_debug(

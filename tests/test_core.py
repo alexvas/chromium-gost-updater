@@ -74,3 +74,69 @@ def test_downloader_version_from_cached_filename_linux(monkeypatch, updater):
         "chromium-gost-142.0.7444.176-linux-amd64.deb"
     )
     assert version == "142.0.7444.176"
+
+
+def test_cleanup_stale_state_versions_keeps_only_current_remote(monkeypatch, updater):
+    saved_states = []
+    monkeypatch.setattr(
+        updater,
+        "load_state",
+        lambda: {
+            "ignored_versions": [],
+            "remind_at": {
+                "143.0.7499.169": 1.0,
+                "143.0.7499.193": 2.0,
+                "146.0.7680.216": 3.0,
+            },
+        },
+    )
+    monkeypatch.setattr(
+        updater,
+        "save_state",
+        lambda state: saved_states.append(dict(state)),
+    )
+
+    app = updater.UpdaterAppImpl()
+    app.current_package_versions.set_remote("146.0.7680.216")
+    app.cleanup_stale_state_versions()
+
+    assert app.state["remind_at"] == {"146.0.7680.216": 3.0}
+    assert len(saved_states) == 1
+
+
+def test_cleanup_stale_state_versions_skips_when_remote_unknown(monkeypatch, updater):
+    saved_states = []
+    monkeypatch.setattr(
+        updater,
+        "load_state",
+        lambda: {
+            "ignored_versions": [],
+            "remind_at": {"143.0.7499.193": 2.0},
+        },
+    )
+    monkeypatch.setattr(
+        updater,
+        "save_state",
+        lambda state: saved_states.append(dict(state)),
+    )
+
+    app = updater.UpdaterAppImpl()
+    app.current_package_versions.set_remote(None)
+    app.cleanup_stale_state_versions()
+
+    assert app.state["remind_at"] == {"143.0.7499.193": 2.0}
+    assert saved_states == []
+
+
+@pytest.mark.parametrize(
+    ("args", "env", "expected"),
+    [
+        (["-session", "abc"], {}, "qt-session-restore"),
+        (["--show-tray-lazily"], {"INVOCATION_ID": "x"}, "systemd-user-service"),
+        (["--check-only"], {}, "check-only"),
+        (["--show-tray-lazily"], {}, "lazy-cli"),
+        ([], {}, "direct-cli"),
+    ],
+)
+def test_detect_launch_source(updater, args, env, expected):
+    assert updater.detect_launch_source(args=args, env=env) == expected
