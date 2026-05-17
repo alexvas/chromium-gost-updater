@@ -9,11 +9,20 @@ def _setup_cache_paths(monkeypatch, updater, tmp_path):
     return cache_dir, manifest_path
 
 
+def _pkg_ext(updater):
+    return updater.PACKAGE_MANAGER.get_extension()
+
+
+def _pkg_filename(version, ext):
+    return f"chromium-gost-{version}-linux-amd64.{ext}"
+
+
 def test_register_in_cache_writes_manifest_entry(monkeypatch, updater, tmp_path):
     _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
-    artifact = tmp_path / "chromium-gost-142.0.7444.176-linux-amd64.deb"
+    artifact = tmp_path / _pkg_filename("142.0.7444.176", ext)
     artifact.write_bytes(b"x" * 16)
 
     downloader._register_in_cache(
@@ -39,9 +48,10 @@ def test_get_valid_cached_package_marks_error_when_invalid(
 ):
     cache_dir, _ = _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
     version = "142.0.7444.176"
-    filename = f"chromium-gost-{version}-linux-amd64.deb"
+    filename = _pkg_filename(version, ext)
     artifact = cache_dir / filename
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b"payload")
@@ -71,9 +81,10 @@ def test_get_valid_cached_package_recovers_non_ok_status_when_valid(
 ):
     cache_dir, _ = _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
     version = "142.0.7444.200"
-    filename = f"chromium-gost-{version}-linux-amd64.deb"
+    filename = _pkg_filename(version, ext)
     artifact = cache_dir / filename
     artifact.parent.mkdir(parents=True, exist_ok=True)
     artifact.write_bytes(b"payload")
@@ -100,11 +111,12 @@ def test_get_valid_cached_package_recovers_non_ok_status_when_valid(
 def test_cleanup_old_cache_files_removes_stale_entries(monkeypatch, updater, tmp_path):
     cache_dir, _ = _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
     stale_version = "142.0.7000.1"
     fresh_version = "142.0.8000.1"
-    stale_name = f"chromium-gost-{stale_version}-linux-amd64.deb"
-    fresh_name = f"chromium-gost-{fresh_version}-linux-amd64.deb"
+    stale_name = _pkg_filename(stale_version, ext)
+    fresh_name = _pkg_filename(fresh_version, ext)
 
     stale_file = cache_dir / stale_name
     fresh_file = cache_dir / fresh_name
@@ -146,11 +158,12 @@ def test_rebuild_cache_manifest_if_missing_restores_from_files(
 ):
     cache_dir, manifest_path = _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
     version_ok = "142.0.9000.1"
     version_bad = "142.0.9000.2"
-    file_ok = cache_dir / f"chromium-gost-{version_ok}-linux-amd64.deb"
-    file_bad = cache_dir / f"chromium-gost-{version_bad}-linux-amd64.deb"
+    file_ok = cache_dir / _pkg_filename(version_ok, ext)
+    file_bad = cache_dir / _pkg_filename(version_bad, ext)
     unrelated = cache_dir / "random-file.txt"
 
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -162,7 +175,7 @@ def test_rebuild_cache_manifest_if_missing_restores_from_files(
     manifest_path.write_text("[packages]\n", encoding="utf-8")
 
     def fake_validate_artifact(path, extension):
-        assert extension == "deb"
+        assert extension == ext
         return path.name == file_ok.name
 
     monkeypatch.setattr(updater, "validate_artifact", fake_validate_artifact)
@@ -182,9 +195,10 @@ def test_rebuild_cache_manifest_if_missing_keeps_existing_packages(
 ):
     cache_dir, _ = _setup_cache_paths(monkeypatch, updater, tmp_path)
     downloader = updater.Downloader()
+    ext = _pkg_ext(updater)
 
     existing_version = "142.0.9500.1"
-    existing_name = f"chromium-gost-{existing_version}-linux-amd64.deb"
+    existing_name = _pkg_filename(existing_version, ext)
     existing_file = cache_dir / existing_name
     existing_file.parent.mkdir(parents=True, exist_ok=True)
     existing_file.write_bytes(b"existing")
@@ -200,7 +214,7 @@ def test_rebuild_cache_manifest_if_missing_keeps_existing_packages(
 
     # Файл, который был бы подобран rebuild, если бы не ранний выход
     another_version = "142.0.9500.2"
-    another_name = f"chromium-gost-{another_version}-linux-amd64.deb"
+    another_name = _pkg_filename(another_version, ext)
     another_file = cache_dir / another_name
     another_file.write_bytes(b"another")
 
